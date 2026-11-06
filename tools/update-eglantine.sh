@@ -8,6 +8,13 @@ set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+# The NUP experiment deliberately pins the core.  Updating it to the latest nx2
+# would invalidate the generated 0018 patch and 17 PS5-specific compatibility patches.
+if [[ -f "$root/tools/generate-nup-backport.py" ]]; then
+    echo "NUP test build pins Eglantine at 3140648a; make update is disabled for this experimental branch." >&2
+    echo "Keep the working release on main. A full-core migration needs its own reviewed port." >&2
+    exit 2
+fi
 git submodule update --init Eglantine
 # The patches (tools/eglantine-patches) come out first, so the submodule moves from a clean tree.
 bash tools/apply-eglantine-patches.sh --revert

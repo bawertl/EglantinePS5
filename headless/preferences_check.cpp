@@ -81,6 +81,10 @@ int main() {
     // Last and recent games.
     assert(Eden::SaveLastGame("Sample Quest [id].nsp", file));
     assert(Eden::LoadLastGame(file) == "Sample Quest [id].nsp");
+    assert(Eden::ValidRomFilename("Switch2 Game.nup") && Eden::ValidRomFilename("Switch2 Game.NUP"));
+    assert(Eden::SaveLastGame("Switch2 Game.nup", file));
+    assert(Eden::LoadLastGame(file) == "Switch2 Game.nup");
+    assert(Eden::SaveLastGame("Sample Quest [id].nsp", file));
     for (const char* invalid : {"../escape.nsp", "game.zip", "a/b.nsp"}) assert(!Eden::SaveLastGame(invalid, file));
     assert(Eden::LoadLastGame(file) == "Sample Quest [id].nsp");
     assert(Eden::SaveRecentGame("Sample Quest.nsp", file));

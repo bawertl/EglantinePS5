@@ -104,6 +104,14 @@ int main() {
     auto matched = Select(true);
     assert(matched.selected == "/roms/named.xci" && matched.error.empty());
     assert(launcher_calls == 0 && matched.probe);
+    entries = {{"040074A01BF12000.nup"}};
+    metadata = 0;
+    auto nup = Select(true);
+    assert(nup.selected == "/roms/040074A01BF12000.nup" && nup.error.empty());
+    entries = {{"game.NUP"}};
+    metadata = 0x040074A01BF12000ULL;
+    // Development selection uses the id in the name or the real NUP metadata.
+    // The normal Library accepts uppercase extensions independently.
     auto first = Select(false);
     assert(first.selected == launcher_choice && first.error.empty() && launcher_calls == 1 && !first.probe);
     launcher_choice.clear();

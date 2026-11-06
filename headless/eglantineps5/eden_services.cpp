@@ -906,7 +906,7 @@ std::string EdenServices::version() {
 }
 
 // Games on NFS servers (nfs/nfs.h): the addresses are the lines of config/nfs.txt, mounted in the background
-// at start. Each .nsp and .xci in a share's folder (or one folder down) is listed with the local games, under
+// at start. Each .nsp, .xci and .nup in a share's folder (or one folder down) is listed with the local games, under
 // roms/ by its file name: nfs_alias makes that path be the file on the share. A name the console already has
 // is left to the console's file.
 // The addresses kept in config/nfs.txt, one per line (what the keyboard of Settings > NFS shares writes).
@@ -1076,7 +1076,7 @@ std::vector<pe::ui::Game> EdenServices::games() {
         std::string format = file.substr(dot + 1);
         std::transform(format.begin(), format.end(), format.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        if (format != "NSP" && format != "XCI" && format != "DIR") continue;
+        if (format != "NSP" && format != "XCI" && format != "NUP" && format != "DIR") continue;
         const std::string path = RomPath(file);
         struct stat info {};
         if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
@@ -1445,7 +1445,7 @@ pe::ui::FolderInfo EdenServices::folder_info(const std::string& directory) {
     pe::ui::FolderInfo info;
     info.keys = Eden::FileExists(JoinPath(directory, "keys/prod.keys"));
     info.firmware = CountFiles(JoinPath(directory, "firmware"), {".nca"});
-    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci"});
+    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci", ".nup"});
     return info;
 }
 
