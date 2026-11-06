@@ -1,4 +1,4 @@
-# NUP integration (experimental, v1.000.001)
+# NUP integration (experimental, v1.000.003)
 
 **Base:** EglantinePS5 `main` ZIP supplied by the user, with `Eglantine` gitlink pinned at
 `3140648a668aaebf87bae2dea17512fdca125ba0`. **Source of the NUP parser and loader:**
@@ -10,8 +10,8 @@ GPL-3.0-or-later). **No Lichii `nx2` full-core upgrade is performed.**
 `make deps` initializes the pinned core, fetches the named upstream NUP commit into
 its *object database only* (`git fetch origin <sha>`), generates
 `tools/eglantine-patches/0018-add-native-nup-support.patch` and applies it after the
-17 original PS5 patches. The generated patch contains the four *actual* upstream NUP
-source files and narrowly scoped registrations in the old core's CMake, core,
+17 original PS5 patches. The generated patch contains the four upstream NUP source files (with a minimal
+V1.000.003 dual-layout adaptation to `nup_container.cpp` only) and narrowly scoped registrations in the old core's CMake, core,
 loader header and loader dispatch. The gitlink/HEAD remains unchanged.
 
 The generated 0018 patch is deliberately not checked in because the normal GitHub
@@ -69,3 +69,28 @@ have not been intentionally modified.
 
 For a verified stable release, add a synthetic NUP integrity/malformed-header
 suite, compile with CI and test on the real PS5 before merging the work.
+
+## V1.000.003: validated NUP record layouts
+
+Offline inspection of a user-supplied 64-KiB NUP prefix confirmed a valid SHA-256
+TOC hash (from a separate full TOC check) and an aligned package/file record
+layout different from the older pinned Lichii C++ structure. The first 635
+file records fit the aligned layout; this is not proof that the whole NUP
+container or game is valid. The Windows offline inspection is read-only.
+
+At GitHub build time `tools/generate-nup-backport.py` transforms **only** the
+upstream `nup_container.cpp` using `tools/nup_v1000003_layout.py`. The generated
+0018 patch is still created from the immutable pinned git commits. It retains
+the legacy layouts and parses the aligned package (metadata at +0x20/+0x28) and
+file record (size +0x08, extent +0x10/+0x18, SHA-256 +0x20, codec +0x40).
+The aligned metadata size is **u32**, codec/codec_flags are separate **u8** fields.
+No unsupported codec, e.g. LZ4, is enabled. All file records are validated, and
+ambiguous or inconsistent file layouts fail closed. The original ExeFS update
+selection remains untouched; NUP's original `ErrorNUPNoBasePackage` behavior is
+not bypassed. Existing 17 PS5 patches, NSP/XCI loading, Vulkan and PS5 App-ID
+are unchanged. Only `sce_sys/param.json` has its version updated.
+
+A local Python syntax test can validate the patch generator, but **no PS5 C++
+compilation or hardware gameplay test has been performed** in this environment.
+The Release build and real-console tests remain essential. On parser failure,
+inspect the `NUP-DIAG` lines in stderr/eden logs for format/layout reasons.

@@ -3,8 +3,9 @@
 """Generate the PS5 NUP core backport from the *real* upstream source commit.
 
 The Eglantine gitlink is fixed to 3140648a...; this does NOT update it.  The four
-new source files are copied byte-for-byte from the pinned NUP introduction commit;
-only the existing loader, system and CMake registration sites are changed.
+new source files come from the pinned NUP introduction commit. V1.000.003
+additionally adapts only nup_container.cpp to handle both validated record
+layouts; existing loader, system and CMake registrations are retained.
 The generated 0018 patch participates in the ordinary 0001..0018 apply/revert
 sequence.  Run this after `git submodule update --init` and before apply patches.
 
@@ -12,6 +13,7 @@ No source is downloaded from an unpinned branch.  The commit may be fetched from
 its own git remote, but never checked out and never made the submodule's HEAD.
 """
 from __future__ import annotations
+from nup_v1000003_layout import modify_nup_container
 import argparse
 import difflib
 import pathlib
@@ -175,6 +177,11 @@ def main() -> int:
         if git("cat-file", "-e", f"HEAD:{path}", check=False).returncode == 0:
             raise BackportError(f"Safety stop: {path} already exists in the pinned core")
         original = git_bytes(SOURCE, path)
+        if path == "src/core/file_sys/nup_container.cpp":
+            try:
+                original = modify_nup_container(original.decode("utf-8")).encode("utf-8")
+            except ValueError as error:
+                raise BackportError(f"NUP V1.000.003 layout patch rejected: {error}") from error
         if not original.endswith(b"\n"):
             raise BackportError(f"Source file {path} unexpectedly has no final newline")
         changes.append(make_diff(path, b"", original))
