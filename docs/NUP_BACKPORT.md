@@ -1,4 +1,4 @@
-# NUP integration (experimental, v1.000.003)
+# NUP integration (experimental, v1.000.004)
 
 **Base:** EglantinePS5 `main` ZIP supplied by the user, with `Eglantine` gitlink pinned at
 `3140648a668aaebf87bae2dea17512fdca125ba0`. **Source of the NUP parser and loader:**
@@ -94,3 +94,27 @@ A local Python syntax test can validate the patch generator, but **no PS5 C++
 compilation or hardware gameplay test has been performed** in this environment.
 The Release build and real-console tests remain essential. On parser failure,
 inspect the `NUP-DIAG` lines in stderr/eden logs for format/layout reasons.
+
+## V1.000.004: narrow Switch 2 audio-device-manager backport
+
+The PS5 V1.000.003 logs confirmed that `auddmg:u` was not registered immediately
+before the guest SDK dereferenced a null interface. Original source of the
+`auddmg:u` command-0 IPC object and its virtual-device commands: Lichii
+`09b78bd2dfdd279cc81caed2a794ed85062725c9`,
+`src/core/hle/service/audio/nx2_audio_device_manager.h`.
+
+Patch `0019-switch2-auddmg-virtual-device-manager.patch` is a **separate** checked-in
+patch applied after the generated NUP `0018`. It registers the dedicated
+`auddmg:u` service, returns a genuine manager IPC object on command 0, and
+implements upstream-defined virtual-device commands 0, 100, 300, 401 and 500.
+The newer upstream sysmix code cannot be copied unchanged into the pinned core:
+it depends on `Read32Acquire`, `StreamType::Sysmix`, `IsReady` and
+`TryAppendOutputBlock`, which are not available in the pinned version.
+Consequently stream commands 700 and 800 explicitly reply `ResultNotSupported`,
+not false success; `audsmx:u` itself has **not** been ported. This may block
+a later game-start stage, and is not represented as complete Switch 2 audio.
+
+The NUP format/parser, original core gitlink, previous 17 patches, NSP/XCI,
+PS5 app ID and Vulkan path are unchanged. Only a real GitHub Actions compile
+and a real-PS5 run will verify whether the change works and where boot goes next.
+Do not merge into `main` before existing games regressions have been tested.

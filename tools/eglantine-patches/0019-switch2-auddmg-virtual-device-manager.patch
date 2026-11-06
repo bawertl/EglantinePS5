@@ -1,0 +1,205 @@
+diff --git a/src/core/hle/service/audio/audio.cpp b/src/core/hle/service/audio/audio.cpp
+--- a/src/core/hle/service/audio/audio.cpp
++++ b/src/core/hle/service/audio/audio.cpp
+@@ -7,5 +7,6 @@
+ #include "core/core.h"
+ #include "core/hle/service/audio/audio.h"
+ #include "core/hle/service/audio/nx2_audio_user_client.h"
++#include "core/hle/service/audio/nx2_audio_device_manager.h"
+ #include "core/hle/service/audio/audio_controller.h"
+ #include "core/hle/service/audio/audio_in_manager.h"
+@@ -204,5 +204,6 @@
+     server_manager->RegisterNamedService("audren:u", std::make_shared<IAudioRendererManager>(system), 30);
+     // Switch 2 audio entry point (nn::audio::CreateUserClientSessionByHipc).
+     server_manager->RegisterNamedService("aud:u", std::make_shared<INx2AudioUserClient>(system), 30);
++    server_manager->RegisterNamedService("auddmg:u", std::make_shared<INx2AudioDeviceManagerService>(system), 30);
+     server_manager->RegisterNamedService("audren:a", std::make_shared<IAudioRendererManagerForApplet>(system), 30);
+     server_manager->RegisterNamedService("hwopus", std::make_shared<IHardwareOpusDecoderManager>(system), 25);
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -529,6 +529,7 @@
+     hle/service/audio/audio_renderer_manager.cpp
+     hle/service/audio/audio_renderer_manager.h
+     hle/service/audio/nx2_audio_user_client.h
++    hle/service/audio/nx2_audio_device_manager.h
+     hle/service/audio/audio_renderer.cpp
+     hle/service/audio/audio_renderer.h
+     hle/service/audio/audio.cpp
+diff --git a/src/core/hle/service/audio/nx2_audio_device_manager.h b/src/core/hle/service/audio/nx2_audio_device_manager.h
+new file mode 100644
+--- /dev/null
++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
+@@ -0,0 +1,172 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// V1.000.004: small, self-contained backport of the upstream Lichii Switch 2
++// auddmg:u virtual-device IPC. Upstream reference commit:
++// 09b78bd2dfdd279cc81caed2a794ed85062725c9
++// Only the device-manager path is included; the newer sysmix streamer relies on
++// APIs absent from the pinned core. Stream operations therefore explicitly
++// return an unsupported result; they never falsely report success.
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <string_view>
++
++#include "audio_core/common/common.h"
++#include "common/logging.h"
++#include "core/core.h"
++#include "core/hle/kernel/k_event.h"
++#include "core/hle/service/audio/errors.h"
++#include "core/hle/service/ipc_helpers.h"
++#include "core/hle/service/kernel_helpers.h"
++#include "core/hle/service/service.h"
++
++namespace Service::Audio {
++
++// The device object returned by auddmg:u command 0. Command IDs and wire
++// formats are ported from Lichii's nx2_audio_device_manager.h at the pinned
++// upstream reference above; not guessed from the game's crash log.
++class INx2AudioVirtualDeviceManager final
++    : public ServiceFramework<INx2AudioVirtualDeviceManager> {
++public:
++    explicit INx2AudioVirtualDeviceManager(Core::System& system_)
++        : ServiceFramework{system_, "nx2:auddmg:u:manager"},
++          service_context{system_, "nx2:auddmg:u:manager"},
++          state_event{service_context.CreateEvent("nx2:auddmg:u:StateEvent")} {
++        static const FunctionInfo functions[] = {
++            {0, &INx2AudioVirtualDeviceManager::ListVirtualOutputDevices,
++             "ListVirtualOutputDevices"},
++            {100, &INx2AudioVirtualDeviceManager::GetDefaultVirtualOutputDevice,
++             "GetDefaultVirtualOutputDevice"},
++            {300, &INx2AudioVirtualDeviceManager::IsStreamFormatSupported,
++             "IsVirtualOutputDeviceStreamFormatSupported"},
++            {401, &INx2AudioVirtualDeviceManager::GetVirtualOutputDeviceProperties,
++             "GetVirtualOutputDeviceProperties"},
++            {500, &INx2AudioVirtualDeviceManager::AcquireStateChangeEvent,
++             "AcquireVirtualOutputDeviceStateEvent"},
++            {700, &INx2AudioVirtualDeviceManager::UnsupportedStreamOperation,
++             "AttachStream (requires sysmix)"},
++            {800, &INx2AudioVirtualDeviceManager::UnsupportedStreamOperation,
++             "DetachStream (requires sysmix)"},
++        };
++        RegisterHandlers(functions);
++    }
++
++    ~INx2AudioVirtualDeviceManager() override {
++        service_context.CloseEvent(state_event);
++    }
++
++private:
++    static constexpr std::size_t NameSize = 0x100;
++    static constexpr std::string_view DeviceName = "AudioVirtualOutput0";
++    static constexpr std::string_view PhysicalDeviceName = "AudioTvOutput";
++
++    static void CopyName(u8* out, std::string_view name) {
++        std::memcpy(out, name.data(), std::min(name.size(), NameSize - 1));
++    }
++
++    void ListVirtualOutputDevices(HLERequestContext& ctx) {
++        std::array<u8, NameSize> names{};
++        CopyName(names.data(), DeviceName);
++        const u32 count = ctx.GetWriteBufferSize() >= NameSize ? 1 : 0;
++        if (count) {
++            ctx.WriteBuffer(names);
++        }
++        LOG_DEBUG(Service_Audio, "auddmg:u: {} virtual output device(s)", count);
++        IPC::ResponseBuilder rb{ctx, 3};
++        rb.Push(ResultSuccess);
++        rb.Push(count);
++    }
++
++    void GetDefaultVirtualOutputDevice(HLERequestContext& ctx) {
++        std::array<u8, NameSize> name{};
++        CopyName(name.data(), DeviceName);
++        ctx.WriteBuffer(name);
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultSuccess);
++    }
++
++    void IsStreamFormatSupported(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto type = rp.Pop<u32>();
++        const auto channels = rp.Pop<u32>();
++        const auto rate = rp.Pop<u32>();
++        const auto functionality = rp.Pop<u32>();
++        const bool supported =
++            (type == static_cast<u32>(AudioCore::SampleFormat::PcmInt16) ||
++             type == static_cast<u32>(AudioCore::SampleFormat::PcmFloat)) &&
++            channels == 2 && rate == 48000 && functionality == 1;
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(supported ? ResultSuccess : ResultNotSupported);
++    }
++
++    void GetVirtualOutputDeviceProperties(HLERequestContext& ctx) {
++        std::array<u8, 0x228> block{};
++        const auto name = ctx.ReadBuffer(0);
++        if (!name.empty()) {
++            std::memcpy(block.data(), name.data(), std::min(name.size(), NameSize - 1));
++        }
++        const auto put32 = [&](std::size_t offset, u32 value) {
++            std::memcpy(block.data() + offset, &value, sizeof(value));
++        };
++        put32(0x100, 3);
++        put32(0x104, 2);
++        put32(0x108, 2);      // stereo
++        put32(0x10c, 48000);  // Hz
++        CopyName(block.data() + 0x110, PhysicalDeviceName);
++        const u64 latency_ns = 10'000'000;
++        std::memcpy(block.data() + 0x218, &latency_ns, sizeof(latency_ns));
++        put32(0x220, 1);
++        ctx.WriteBuffer(block);
++        LOG_DEBUG(Service_Audio, "auddmg:u: virtual output device properties requested");
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultSuccess);
++    }
++
++    void AcquireStateChangeEvent(HLERequestContext& ctx) {
++        IPC::ResponseBuilder rb{ctx, 2, state_event != nullptr ? 1u : 0u};
++        rb.Push(state_event != nullptr ? ResultSuccess : ResultOutOfSessions);
++        if (state_event != nullptr) {
++            rb.PushCopyObjects(ctx, state_event->GetReadableEvent());
++        }
++    }
++
++    void UnsupportedStreamOperation(HLERequestContext& ctx) {
++        LOG_WARNING(Service_Audio,
++                    "auddmg:u stream operation {} is unavailable in the pinned PS5 core",
++                    ctx.GetCommand());
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultNotSupported);
++    }
++
++    KernelHelpers::ServiceContext service_context;
++    Kernel::KEvent* state_event;
++};
++
++// Switch 2 auddmg:u command 0 opens the virtual output device manager. This
++// response must carry an IPC object, not merely an empty success result.
++class INx2AudioDeviceManagerService final
++    : public ServiceFramework<INx2AudioDeviceManagerService> {
++public:
++    explicit INx2AudioDeviceManagerService(Core::System& system_)
++        : ServiceFramework{system_, "nx2:auddmg:u"} {
++        static const FunctionInfo functions[] = {
++            {0, &INx2AudioDeviceManagerService::OpenVirtualDeviceManager,
++             "OpenVirtualDeviceManager"},
++        };
++        RegisterHandlers(functions);
++    }
++
++private:
++    void OpenVirtualDeviceManager(HLERequestContext& ctx) {
++        LOG_INFO(Service_Audio, "auddmg:u cmd0: returning a virtual output device manager");
++        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
++        rb.Push(ResultSuccess);
++        rb.PushIpcInterface<INx2AudioVirtualDeviceManager>(ctx, system);
++    }
++};
++
++} // namespace Service::Audio
