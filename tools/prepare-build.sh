@@ -63,6 +63,19 @@ bash tools/build-common-dialog-stub.sh
 # driver built with another version of it is built again (only the changed file compiles).
 # So is a driver built from another Mesa revision than tools/deps.json pins.
 radv_release=../mihawk-vulkan-review/.deps/native/radv-release
+radv_work=../mihawk-vulkan-review/.deps/work
+# A cached RADV binary alone is insufficient: the PS5 NIR backend also compiles
+# against Mesa's checked-out source and Meson-generated NIR headers.  CI restores
+# the RADV archive, but not those build inputs.  Invalidate its provenance when
+# the headers are missing so upstream build-radv.sh does not exit early just
+# because the cached archive looks current.  This only affects the build cache.
+if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]] && \
+   { [[ ! -f $radv_work/radv-src/src/compiler/nir/nir.h ]] || \
+     [[ ! -f $radv_work/radv-build-ps5-release/src/compiler/nir/nir_builder_opcodes.h ]]; }; then
+    step "RADV: cached driver has no NIR sources/generated headers; rebuild pinned RADV"
+    rm -f "$radv_release/PROVENANCE.txt"
+    rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+fi
 mesa_pin=$(python3 -c 'import json; print(next(i["commit"] for i in json.load(open("tools/deps.json"))["items"] if i["name"] == "ps5-mesa"))')
 if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
     built=$(sed -n 's/^revision: //p' "$radv_release/PROVENANCE.txt" 2>/dev/null || true)
@@ -84,7 +97,7 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     fi
 fi
-if [[ ! -f build/radv-isolated/libvulkan_radeon.ps5.a ]]; then
+if [[ ! -f build/radv-isolated/libvulkan_radeon.ps5.a || ! -f build/radv-isolated/symbols.map ]]; then
     if [[ ! -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV (Mesa) for the PS5 - this takes a while"
         bash tools/build-radv-dependencies.sh
