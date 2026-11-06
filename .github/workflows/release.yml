@@ -126,6 +126,12 @@ jobs:
       - name: Fetch dependencies
         run: make deps
 
+      # Generated 0018 and the PS5 entry points must match the pinned NUP loader.
+      - name: Verify experimental NUP backport
+        run: |
+          python3 -B tools/generate-nup-backport.py --check
+          python3 -B tools/check-nup-bridge.py
+
       # After `make deps`: a restored RADV folder would otherwise stand in for the git checkout
       # it lives in, and deps.py would not fetch that checkout. With the driver go the Payload
       # SDK and zlib its build sets up beside it: the final link takes libraries from that SDK.
