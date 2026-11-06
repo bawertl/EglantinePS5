@@ -1,4 +1,4 @@
-# NUP integration (experimental, v1.000.004)
+# NUP integration (experimental, v1.000.005)
 
 **Base:** EglantinePS5 `main` ZIP supplied by the user, with `Eglantine` gitlink pinned at
 `3140648a668aaebf87bae2dea17512fdca125ba0`. **Source of the NUP parser and loader:**
@@ -118,3 +118,49 @@ The NUP format/parser, original core gitlink, previous 17 patches, NSP/XCI,
 PS5 app ID and Vulkan path are unchanged. Only a real GitHub Actions compile
 and a real-PS5 run will verify whether the change works and where boot goes next.
 Do not merge into `main` before existing games regressions have been tested.
+
+## V1.000.005: Switch 2 sound mixer service and pinned-core compatibility adapter
+
+Real-console V1.000.004 logs confirmed `auddmg:u` command 0 returns an IPC
+object but `audsmx:u` remains absent in two starts; all four sessions still
+ended in a guest `0xF001` panic at `sdk+0x1A5564`. This is **not** proof the
+missing service is the sole cause. The `SFCI` domain-object warning is real,
+but its attribution remains unverified.
+
+Patch `0020-switch2-audsmx-sysmix-backport.patch` applies after the checked-in
+0019 (which itself applies after generated NUP 0018). It adds `audsmx:u`
+through the existing `audio.cpp` named-service registration, and shares
+`Nx2SysmixStreams` between the existing auddmg virtual-device manager and
+new `INx2AudioSoundMixerService`. Command 0 checks the copied process handle
+and returns a real `INx2SysmixUserSession` IPC object. Its upstream commands
+are 1/CreateStream, 2/EngageStreams, 3/DisengageStreams (not guessed 0-3).
+CreateStream validates the mapped ring and returns an actual stream IPC object;
+stream commands 0-8 and 12 follow upstream signatures; unimplemented 9-11
+explicitly return `ResultNotSupported`. The auddmg virtual-device commands
+700/800 now use the shared registry to attach/detach streams.
+
+The native PCM16 ring is adapted from upstream commit
+`09b78bd2dfdd279cc81caed2a794ed85062725c9` to pinned core
+`3140648a668aaebf87bae2dea17512fdca125ba0`. The pinned sink has no
+`StreamType::Sysmix`, `TryAppendOutputBlock`, or `IsReady`, and memory has no
+`Read32Acquire`. Instead this adapter uses the existing `StreamType::Out`,
+checks `GetQueueSize()` against a four-block bound before `AppendBuffer`,
+uses guest `ReadBlock` plus a host acquire fence and `WriteExclusive32` for
+the ring consumer. **These are not behaviorally identical to newer APIs.**
+The older sink exposes no readiness/error API; backend failures cannot always
+be detected. This requires testing on real hardware before declaring audio
+correct or crash-free. No fake successful stream-open result is returned when
+the host sink pointer is null or ring validation fails.
+
+No forced NUP-as-NSP content-provider registration has been introduced: the
+warning about `Game contents not registered` is emitted by NSP-only lookup
+while the dedicated NUP loader already supplies merged RomFS via RomFSFactory.
+The warning's causal relevance to `0xF001` remains unproven. NSP/XCI, prior
+patches, main branch and PS5 App-ID were not modified by this update.
+
+**Verification performed here:** 0020 patch syntax and full git-apply test
+against a representative post-0019 fixture; ZIP CRC and changed-file audit.
+**Not performed here:** full patch application to a real pinned submodule
+checkout, PS5 C++ toolchain build, real hardware boot/audio test. Run GitHub
+Actions Release on `feature/native-nup-loader` and inspect compile errors
+before testing on the PS5.

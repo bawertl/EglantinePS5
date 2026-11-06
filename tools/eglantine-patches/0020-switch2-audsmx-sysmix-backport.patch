@@ -1,0 +1,809 @@
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index de8bf61..4698ed7 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -3,6 +3,8 @@
+     hle/service/audio/audio_renderer_manager.h
+     hle/service/audio/nx2_audio_user_client.h
+     hle/service/audio/nx2_audio_device_manager.h
++    hle/service/audio/nx2_sysmix.cpp
++    hle/service/audio/nx2_sysmix.h
+     hle/service/audio/audio_renderer.cpp
+     hle/service/audio/audio_renderer.h
+     hle/service/audio/audio.cpp
+diff --git a/src/core/hle/service/audio/audio.cpp b/src/core/hle/service/audio/audio.cpp
+index 7ff67a6..a31c76f 100644
+--- a/src/core/hle/service/audio/audio.cpp
++++ b/src/core/hle/service/audio/audio.cpp
+@@ -1,5 +1,6 @@
+ void LoopProcess(Core::System& system) {
+     auto server_manager = std::make_unique<ServerManager>(system);
++    auto sysmix = std::make_shared<Nx2SysmixStreams>(system);
+ 
+     server_manager->RegisterNamedService("aud:a", std::make_shared<IAudioSystemManagerForApplet>(system), 30);
+     server_manager->RegisterNamedService("aud:d", std::make_shared<IAudioSystemManagerForDebugger>(system), 30);
+@@ -21,7 +22,8 @@ void LoopProcess(Core::System& system) {
+     server_manager->RegisterNamedService("audren:u", std::make_shared<IAudioRendererManager>(system), 30);
+     // Switch 2 audio entry point (nn::audio::CreateUserClientSessionByHipc).
+     server_manager->RegisterNamedService("aud:u", std::make_shared<INx2AudioUserClient>(system), 30);
+-    server_manager->RegisterNamedService("auddmg:u", std::make_shared<INx2AudioDeviceManagerService>(system), 30);
++    server_manager->RegisterNamedService("auddmg:u", std::make_shared<INx2AudioDeviceManagerService>(system, sysmix), 30);
++    server_manager->RegisterNamedService("audsmx:u", std::make_shared<INx2AudioSoundMixerService>(system, sysmix), 30);
+     server_manager->RegisterNamedService("audren:a", std::make_shared<IAudioRendererManagerForApplet>(system), 30);
+     server_manager->RegisterNamedService("hwopus", std::make_shared<IHardwareOpusDecoderManager>(system), 25);
+     ServerManager::RunServer(std::move(server_manager));
+diff --git a/src/core/hle/service/audio/nx2_audio_device_manager.h b/src/core/hle/service/audio/nx2_audio_device_manager.h
+index ecd37a9..a5e45a5 100644
+--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
+@@ -3,39 +3,99 @@
+ 
+ #pragma once
+ 
+-// V1.000.004: small, self-contained backport of the upstream Lichii Switch 2
+-// auddmg:u virtual-device IPC. Upstream reference commit:
+-// 09b78bd2dfdd279cc81caed2a794ed85062725c9
+-// Only the device-manager path is included; the newer sysmix streamer relies on
+-// APIs absent from the pinned core. Stream operations therefore explicitly
+-// return an unsupported result; they never falsely report success.
++// V1.000.005: Switch 2 audio device manager plus sound mixer IPC.
++// Protocol reference: Lichii 09b78bd2dfdd279cc81caed2a794ed85062725c9.
++// The sysmix audio ring and sink are adapted to the pinned 3140648... Core.
++// Unsupported commands return ResultNotSupported rather than fake success.
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <utility>
++#include <vector>
+ #include <cstring>
+ #include <string_view>
+ 
++#include "audio_core/audio_core.h"
+ #include "audio_core/common/common.h"
+ #include "common/logging.h"
++#include "common/string_util.h"
++#include "core/core_timing.h"
++#include "core/hle/kernel/k_process.h"
++#include "core/hle/kernel/k_thread.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_event.h"
+ #include "core/hle/service/audio/errors.h"
++#include "core/hle/service/audio/nx2_sysmix.h"
+ #include "core/hle/service/ipc_helpers.h"
+ #include "core/hle/service/kernel_helpers.h"
+ #include "core/hle/service/service.h"
+ 
+ namespace Service::Audio {
+ 
++// Shared stream registry and 5-ms sink pump: one instance per audio service process.
++struct Nx2SysmixStreams {
++    explicit Nx2SysmixStreams(Core::System& system_) : system{system_} {}
++
++    // Avoid a permanent 5-ms timer for Switch 1 NSP/XCI and for any game that
++    // never creates a Switch 2 sysmix stream.
++    void StartPump() {
++        std::scoped_lock lock{mutex};
++        if (timer) return;
++        timer = Core::Timing::CreateEvent("sysmix output", [this](s64, std::chrono::nanoseconds late) {
++            std::unique_lock lock{mutex, std::try_to_lock};
++            if (lock) {
++                for (auto& [id, stream] : streams) {
++                    stream->Pump();
++                }
++            }
++            const auto interval = std::chrono::milliseconds{5};
++            const auto missed = std::max(late, std::chrono::nanoseconds::zero()) / interval;
++            return std::optional<std::chrono::nanoseconds>{interval * (missed + 1)};
++        });
++        system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{5},
++                                                 std::chrono::milliseconds{5}, timer);
++    }
++
++    ~Nx2SysmixStreams() {
++        if (timer) system.CoreTiming().UnscheduleEvent(timer);
++    }
++
++    Result SetEngaged(u32 id, bool engaged, const Kernel::KProcess* process) {
++        std::shared_ptr<SysmixOutput> stream;
++        {
++            std::scoped_lock lock{mutex};
++            const auto it = streams.find(id);
++            R_UNLESS(it != streams.end(), ResultNotFound);
++            stream = it->second;
++        }
++        R_UNLESS(stream->IsOwnedBy(process), ResultInvalidHandle);
++        return stream->SetEngaged(engaged);
++    }
++
++    std::mutex mutex;
++    std::map<u32, std::shared_ptr<SysmixOutput>> streams;
++    u32 next_id{1};
++    Core::System& system;
++    std::shared_ptr<Core::Timing::EventType> timer;
++};
++
+ // The device object returned by auddmg:u command 0. Command IDs and wire
+ // formats are ported from Lichii's nx2_audio_device_manager.h at the pinned
+ // upstream reference above; not guessed from the game's crash log.
+ class INx2AudioVirtualDeviceManager final
+     : public ServiceFramework<INx2AudioVirtualDeviceManager> {
+ public:
+-    explicit INx2AudioVirtualDeviceManager(Core::System& system_)
++    INx2AudioVirtualDeviceManager(Core::System& system_,
++                                  std::shared_ptr<Nx2SysmixStreams> streams_)
+         : ServiceFramework{system_, "nx2:auddmg:u:manager"},
+           service_context{system_, "nx2:auddmg:u:manager"},
+-          state_event{service_context.CreateEvent("nx2:auddmg:u:StateEvent")} {
++          state_event{service_context.CreateEvent("nx2:auddmg:u:StateEvent")},
++          streams{std::move(streams_)} {
+         static const FunctionInfo functions[] = {
+             {0, &INx2AudioVirtualDeviceManager::ListVirtualOutputDevices,
+              "ListVirtualOutputDevices"},
+@@ -47,10 +107,8 @@ public:
+              "GetVirtualOutputDeviceProperties"},
+             {500, &INx2AudioVirtualDeviceManager::AcquireStateChangeEvent,
+              "AcquireVirtualOutputDeviceStateEvent"},
+-            {700, &INx2AudioVirtualDeviceManager::UnsupportedStreamOperation,
+-             "AttachStream (requires sysmix)"},
+-            {800, &INx2AudioVirtualDeviceManager::UnsupportedStreamOperation,
+-             "DetachStream (requires sysmix)"},
++            {700, &INx2AudioVirtualDeviceManager::AttachStream, "AttachStream"},
++            {800, &INx2AudioVirtualDeviceManager::DetachStream, "DetachStream"},
+         };
+         RegisterHandlers(functions);
+     }
+@@ -134,16 +192,31 @@ private:
+         }
+     }
+ 
+-    void UnsupportedStreamOperation(HLERequestContext& ctx) {
+-        LOG_WARNING(Service_Audio,
+-                    "auddmg:u stream operation {} is unavailable in the pinned PS5 core",
+-                    ctx.GetCommand());
++    void AttachStream(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto id = rp.Pop<u32>();
++        const auto functionality = rp.Pop<u32>();
++        const auto result = functionality == 1
++            ? streams->SetEngaged(id, true, ctx.GetThread().GetOwnerProcess())
++            : ResultNotSupported;
++        LOG_INFO(Service_Audio, "auddmg:u attach stream {} functionality={} result={:#x}",
++                 id, functionality, result.raw);
+         IPC::ResponseBuilder rb{ctx, 2};
+-        rb.Push(ResultNotSupported);
++        rb.Push(result);
++    }
++
++    void DetachStream(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto id = rp.Pop<u32>();
++        const auto result = streams->SetEngaged(id, false, ctx.GetThread().GetOwnerProcess());
++        LOG_INFO(Service_Audio, "auddmg:u detach stream {} result={:#x}", id, result.raw);
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(result);
+     }
+ 
+     KernelHelpers::ServiceContext service_context;
+     Kernel::KEvent* state_event;
++    std::shared_ptr<Nx2SysmixStreams> streams;
+ };
+ 
+ // Switch 2 auddmg:u command 0 opens the virtual output device manager. This
+@@ -151,8 +224,9 @@ private:
+ class INx2AudioDeviceManagerService final
+     : public ServiceFramework<INx2AudioDeviceManagerService> {
+ public:
+-    explicit INx2AudioDeviceManagerService(Core::System& system_)
+-        : ServiceFramework{system_, "nx2:auddmg:u"} {
++    INx2AudioDeviceManagerService(Core::System& system_,
++                                 std::shared_ptr<Nx2SysmixStreams> streams_)
++        : ServiceFramework{system_, "nx2:auddmg:u"}, streams{std::move(streams_)} {
+         static const FunctionInfo functions[] = {
+             {0, &INx2AudioDeviceManagerService::OpenVirtualDeviceManager,
+              "OpenVirtualDeviceManager"},
+@@ -165,8 +239,228 @@ private:
+         LOG_INFO(Service_Audio, "auddmg:u cmd0: returning a virtual output device manager");
+         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+         rb.Push(ResultSuccess);
+-        rb.PushIpcInterface<INx2AudioVirtualDeviceManager>(ctx, system);
++        rb.PushIpcInterface<INx2AudioVirtualDeviceManager>(ctx, system, streams);
++    }
++
++    std::shared_ptr<Nx2SysmixStreams> streams;
++};
++
++// The child IPC object returned by sysmix CreateStream. The command IDs and
++// reply shapes follow the upstream implementation rather than guessed stubs.
++class INx2SysmixStreamSession final : public ServiceFramework<INx2SysmixStreamSession> {
++public:
++    INx2SysmixStreamSession(Core::System& system_,
++                           std::shared_ptr<Nx2SysmixStreams> streams_,
++                           std::shared_ptr<SysmixOutput> stream_, u32 id_)
++        : ServiceFramework{system_, "nx2:audsmx:u:stream"}, streams{std::move(streams_)},
++          stream{std::move(stream_)}, id{id_} {
++        static const FunctionInfo functions[] = {
++            {0, &INx2SysmixStreamSession::OpenStream, "OpenStream"},
++            {1, &INx2SysmixStreamSession::CloseStream, "CloseStream"},
++            {2, &INx2SysmixStreamSession::GetStreamState, "GetStreamState"},
++            {3, &INx2SysmixStreamSession::GetStreamGain, "GetStreamGain"},
++            {4, &INx2SysmixStreamSession::SetStreamGain, "SetStreamGain"},
++            {5, &INx2SysmixStreamSession::AcquireStateChangeEvent, "AcquireStreamStateChangeEvent"},
++            {6, &INx2SysmixStreamSession::Succeed, "ReleaseStreamStateChangeEvent"},
++            {7, &INx2SysmixStreamSession::AcquireDataEvent, "AcquireStreamDataEvent"},
++            {8, &INx2SysmixStreamSession::ReleaseDataEvent, "ReleaseStreamDataEvent"},
++            {9, &INx2SysmixStreamSession::Unsupported, "ClockStream"},
++            {10, &INx2SysmixStreamSession::Unsupported, "PrimeStream"},
++            {11, &INx2SysmixStreamSession::Unsupported, "PurgeStream"},
++            {12, &INx2SysmixStreamSession::Succeed, "RenameStream"},
++        };
++        RegisterHandlers(functions);
++    }
++
++    ~INx2SysmixStreamSession() override {
++        {
++            std::scoped_lock lock{streams->mutex};
++            streams->streams.erase(id);
++        }
++        stream->Close();
++    }
++
++private:
++    void OpenStream(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto sample_type = rp.Pop<u32>();
++        const auto channels = rp.Pop<u32>();
++        const auto rate = rp.Pop<u32>();
++        const auto frames = rp.Pop<u32>();
++        const auto prefill = rp.Pop<u32>();
++        const auto flags = rp.Pop<u32>();
++        const auto result = stream->Open(sample_type, channels, rate, frames, prefill, flags);
++        LOG_INFO(Service_Audio, "sysmix stream {} open {} channels={} rate={} frames={} result={:#x}",
++                 id, sample_type, channels, rate, frames, result.raw);
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(result);
++    }
++
++    void CloseStream(HLERequestContext& ctx) {
++        stream->Close();
++        Succeed(ctx);
++    }
++
++    void GetStreamState(HLERequestContext& ctx) {
++        IPC::ResponseBuilder rb{ctx, 3};
++        rb.Push(ResultSuccess);
++        rb.Push(stream->GetState());
++    }
++
++    void GetStreamGain(HLERequestContext& ctx) {
++        IPC::ResponseBuilder rb{ctx, 3};
++        rb.Push(ResultSuccess);
++        rb.Push(stream->GetGain());
++    }
++
++    void SetStreamGain(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto gain = rp.Pop<f32>();
++        rp.Pop<u32>();
++        const auto ramp = rp.Pop<s64>();
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(stream->SetGain(gain, ramp));
++    }
++
++    void AcquireStateChangeEvent(HLERequestContext& ctx) {
++        auto* event = stream->GetStateEvent();
++        IPC::ResponseBuilder rb{ctx, 2, event ? 1u : 0u};
++        rb.Push(event ? ResultSuccess : ResultOutOfSessions);
++        if (event) rb.PushCopyObjects(ctx, event);
+     }
++
++    void AcquireDataEvent(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto mode = rp.Pop<u32>();
++        const auto threshold = rp.Pop<s32>();
++        const auto result = stream->SetDataNotification(mode, threshold);
++        IPC::ResponseBuilder rb{ctx, 2, result.IsSuccess() ? 1u : 0u};
++        rb.Push(result);
++        if (result.IsSuccess()) rb.PushCopyObjects(ctx, stream->GetDataEvent());
++    }
++
++    void ReleaseDataEvent(HLERequestContext& ctx) {
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(stream->SetDataNotification(0, 0));
++    }
++
++    void Unsupported(HLERequestContext& ctx) {
++        LOG_WARNING(Service_Audio, "sysmix stream {} unsupported command {}", id, ctx.GetCommand());
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultNotSupported);
++    }
++
++    void Succeed(HLERequestContext& ctx) {
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultSuccess);
++    }
++
++    std::shared_ptr<Nx2SysmixStreams> streams;
++    std::shared_ptr<SysmixOutput> stream;
++    u32 id;
++};
++
++class INx2SysmixUserSession final : public ServiceFramework<INx2SysmixUserSession> {
++public:
++    INx2SysmixUserSession(Core::System& system_, std::shared_ptr<Nx2SysmixStreams> streams_,
++                         Kernel::KProcess* process_)
++        : ServiceFramework{system_, "nx2:audsmx:u:session"}, streams{std::move(streams_)},
++          process{system.Kernel(), process_} {
++        static const FunctionInfo functions[] = {
++            {1, &INx2SysmixUserSession::CreateStream, "CreateStream"},
++            {2, &INx2SysmixUserSession::EngageStreams, "EngageStreams"},
++            {3, &INx2SysmixUserSession::DisengageStreams, "DisengageStreams"},
++        };
++        RegisterHandlers(functions);
++    }
++
++private:
++    void CreateStream(HLERequestContext& ctx) {
++        IPC::RequestParser rp{ctx};
++        const auto device = rp.Pop<u32>();
++        const auto flags = rp.Pop<u32>();
++        [[maybe_unused]] const auto applet_resource_user_id = rp.Pop<u64>();
++        const auto buffer = rp.Pop<u64>();
++        const auto size = rp.Pop<u64>();
++        Result result = ResultInvalidArgument;
++        if (device == 1 && ctx.GetThread().GetOwnerProcess() == process.GetPointerUnsafe()) {
++            result = SysmixOutput::ValidateRegion(*process, buffer, size, flags);
++        }
++        if (result.IsFailure()) {
++            IPC::ResponseBuilder rb{ctx, 2};
++            rb.Push(result);
++            return;
++        }
++        u32 id{};
++        {
++            std::scoped_lock lock{streams->mutex};
++            id = streams->next_id++;
++        }
++        auto stream = std::make_shared<SysmixOutput>(system, *process,
++            system.AudioCore().GetOutputSink(), id, buffer, size, flags);
++        {
++            std::scoped_lock lock{streams->mutex};
++            streams->streams.emplace(id, stream);
++        }
++        streams->StartPump();
++        LOG_INFO(Service_Audio, "sysmix CreateStream id={} device={} flags={:#x} buf={:#x} size={:#x}",
++                 id, device, flags, buffer, size);
++        IPC::ResponseBuilder rb{ctx, 3, 0, 1};
++        rb.Push(ResultSuccess);
++        rb.Push(id);
++        rb.PushIpcInterface<INx2SysmixStreamSession>(ctx, system, streams, stream, id);
++    }
++
++    void SetEngaged(HLERequestContext& ctx, bool engaged) {
++        const auto buffer = ctx.ReadBuffer(0);
++        Result result = ResultInvalidArgument;
++        if (buffer.size() % sizeof(u32) == 0) {
++            result = ResultSuccess;
++            for (std::size_t offset = 0; offset < buffer.size(); offset += sizeof(u32)) {
++                u32 id{};
++                std::memcpy(&id, buffer.data() + offset, sizeof(id));
++                result = streams->SetEngaged(id, engaged, ctx.GetThread().GetOwnerProcess());
++                if (result.IsFailure()) break;
++            }
++        }
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(result);
++    }
++
++    void EngageStreams(HLERequestContext& ctx) { SetEngaged(ctx, true); }
++    void DisengageStreams(HLERequestContext& ctx) { SetEngaged(ctx, false); }
++
++    std::shared_ptr<Nx2SysmixStreams> streams;
++    Kernel::KScopedAutoObject<Kernel::KProcess> process;
++};
++
++class INx2AudioSoundMixerService final : public ServiceFramework<INx2AudioSoundMixerService> {
++public:
++    INx2AudioSoundMixerService(Core::System& system_,
++                              std::shared_ptr<Nx2SysmixStreams> streams_)
++        : ServiceFramework{system_, "nx2:audsmx:u"}, streams{std::move(streams_)} {
++        static const FunctionInfo functions[] = {
++            {0, &INx2AudioSoundMixerService::OpenUserSession, "OpenUserSession"},
++        };
++        RegisterHandlers(functions);
++    }
++
++private:
++    void OpenUserSession(HLERequestContext& ctx) {
++        auto process = ctx.GetObjectFromHandle<Kernel::KProcess>(ctx.GetCopyHandle(0));
++        if (process.IsNull() || process.GetPointerUnsafe() != ctx.GetThread().GetOwnerProcess()) {
++            LOG_WARNING(Service_Audio, "audsmx:u cmd0 rejected invalid process handle");
++            IPC::ResponseBuilder rb{ctx, 2};
++            rb.Push(ResultInvalidHandle);
++            return;
++        }
++        LOG_INFO(Service_Audio, "audsmx:u cmd0: returning real sysmix user IPC session");
++        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
++        rb.Push(ResultSuccess);
++        rb.PushIpcInterface<INx2SysmixUserSession>(ctx, system, streams, process.GetPointerUnsafe());
++    }
++
++    std::shared_ptr<Nx2SysmixStreams> streams;
+ };
+ 
+ } // namespace Service::Audio
+diff --git a/src/core/hle/service/audio/nx2_sysmix.cpp b/src/core/hle/service/audio/nx2_sysmix.cpp
+new file mode 100644
+index 0000000..4c8f566
+--- /dev/null
++++ b/src/core/hle/service/audio/nx2_sysmix.cpp
+@@ -0,0 +1,323 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Compatible port of Lichii 09b78bd2... sysmix ring transport to pinned Core 3140648...
++// Unlike upstream, the pinned sink has no StreamType::Sysmix/IsReady/
++// TryAppendOutputBlock and Memory has no Read32Acquire. Use StreamType::Out,
++// an explicit 4-block admission bound and validated ReadBlock + CAS instead.
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <mutex>
++#include <span>
++#include <string>
++
++#include "audio_core/common/common.h"
++#include "audio_core/sink/sink.h"
++#include "audio_core/sink/sink_stream.h"
++#include "common/logging.h"
++#include "core/core.h"
++#include "core/hle/kernel/k_event.h"
++#include "core/hle/kernel/k_process.h"
++#include "core/hle/service/audio/errors.h"
++#include "core/hle/service/audio/nx2_sysmix.h"
++#include "core/hle/service/kernel_helpers.h"
++#include "core/memory.h"
++
++namespace Service::Audio {
++namespace {
++constexpr u64 ReadOffset = 0x44;
++constexpr u64 WriteOffset = 0x1004;
++constexpr u64 PayloadOffset = 0x1040;
++constexpr u32 BlockFrames = 240;
++constexpr u32 MaxSinkBlocks = 4;
++u64 AlignUp(u64 value, u64 alignment) {
++    return (value + alignment - 1) & ~(alignment - 1);
++}
++}
++
++struct SysmixOutput::Impl {
++    Impl(Core::System& system_, Kernel::KProcess& process_, AudioCore::Sink::Sink& sink_,
++         u32 id_, u64 buffer_, u64 size_, u32 creation_flags_)
++        : system{system_}, process{system.Kernel(), &process_}, sink{sink_},
++          context{system, "sysmix"}, id{id_}, buffer{buffer_}, size{size_},
++          creation_flags{creation_flags_} {
++        state_event = context.CreateEvent("sysmix state");
++        data_event = context.CreateEvent("sysmix data");
++    }
++
++    ~Impl() {
++        Close();
++        context.CloseEvent(data_event);
++        context.CloseEvent(state_event);
++    }
++
++    void Close() {
++        std::scoped_lock lock{mutex};
++        open = false;
++        engaged = false;
++        data_mode = 0;
++        if (host) {
++            sink.CloseStream(host);
++            host = nullptr;
++        }
++        if (state_event) state_event->Signal(system.Kernel());
++    }
++
++    Result Fault(Result result = ResultInvalidAddressInfo) {
++        faulted = true;
++        engaged = false;
++        ++faults;
++        if (host) host->Stop();
++        if (state_event) state_event->Signal(system.Kernel());
++        LOG_ERROR(Service_Audio, "sysmix {} fault {:#x} copied={} accepted={} stalls={}",
++                  id, result.raw, copied_frames, accepted_frames, backpressure);
++        return result;
++    }
++
++    // This pinned memory API lacks Read32Acquire. ReadBlock validates access;
++    // fence orders host-side observations, while WriteExclusive32 commits the
++    // consumer only if the guest hasn't changed it. This is not a full replacement
++    // for upstream guest-memory acquire semantics; runtime testing is essential.
++    bool ReadIndex(u64 offset, u32& value) {
++        if (!process->GetMemory().ReadBlock(buffer + offset, &value, sizeof(value))) return false;
++        std::atomic_thread_fence(std::memory_order_acquire);
++        return true;
++    }
++
++    bool ReadOccupancy(u32& read, u32& write, u32& filled) {
++        if (!ReadIndex(ReadOffset, read) || read != consumer ||
++            !ReadIndex(WriteOffset, write) || read >= slots || write >= slots) return false;
++        filled = static_cast<u32>((u64{write} + slots - read) % slots);
++        return true;
++    }
++
++    void Notify(u32 filled) {
++        if (data_mode == 2 && slots - 1 - filled >= static_cast<u32>(threshold) && data_event)
++            data_event->Signal(system.Kernel());
++    }
++
++    Core::System& system;
++    Kernel::KScopedAutoObject<Kernel::KProcess> process;
++    AudioCore::Sink::Sink& sink;
++    KernelHelpers::ServiceContext context;
++    Kernel::KEvent* state_event{};
++    Kernel::KEvent* data_event{};
++    AudioCore::Sink::SinkStream* host{};
++    mutable std::mutex mutex;
++    u32 id;
++    u64 buffer;
++    u64 size;
++    u32 creation_flags;
++    AudioCore::SampleFormat format{};
++    u32 frame_bytes{};
++    u32 slots{};
++    u32 consumer{};
++    u32 data_mode{};
++    s32 threshold{};
++    f32 gain{1.0f};
++    bool open{};
++    bool engaged{};
++    bool faulted{};
++    std::array<u8, BlockFrames * 2 * sizeof(f32)> input{};
++    std::array<s16, BlockFrames * 2> output{};
++    u64 copied_frames{};
++    u64 accepted_frames{};
++    u64 admitted_blocks{};
++    u64 backpressure{};
++    u64 faults{};
++};
++
++SysmixOutput::SysmixOutput(Core::System& system, Kernel::KProcess& process,
++                           AudioCore::Sink::Sink& sink, u32 id, u64 buffer, u64 size,
++                           u32 creation_flags)
++    : impl{std::make_unique<Impl>(system, process, sink, id, buffer, size, creation_flags)} {}
++SysmixOutput::~SysmixOutput() = default;
++
++Result SysmixOutput::ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 size,
++                                    u32 creation_flags) {
++    R_UNLESS(creation_flags == 0x24, ResultNotSupported);
++    R_UNLESS(buffer != 0 && (buffer & 0xfff) == 0 && (size & 0xfff) == 0 &&
++                 size >= 0x2000 && size <= std::numeric_limits<u64>::max() - buffer &&
++                 process.GetMemory().IsValidVirtualAddressRange(buffer, size),
++             ResultInvalidAddressInfo);
++    R_SUCCEED();
++}
++
++bool SysmixOutput::IsFormatSupported(u32 sample_type, u32 channels, u32 rate) {
++    return (sample_type == static_cast<u32>(AudioCore::SampleFormat::PcmInt16) ||
++            sample_type == static_cast<u32>(AudioCore::SampleFormat::PcmFloat)) &&
++           channels == 2 && rate == 48000;
++}
++
++Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames,
++                          u32 prefill, u32 flags) {
++    auto& p = *impl;
++    std::scoped_lock lock{p.mutex};
++    R_UNLESS(!p.open, ResultOperationFailed);
++    R_UNLESS(IsFormatSupported(sample_type, channels, rate) && prefill == 0 && flags == 0,
++             ResultNotSupported);
++    R_UNLESS(frames > 0 && frames < static_cast<u32>(std::numeric_limits<s32>::max()),
++             ResultInvalidArgument);
++    R_TRY(ValidateRegion(*p.process, p.buffer, p.size, p.creation_flags));
++    const u64 slots = u64{frames} + 1;
++    const auto format = static_cast<AudioCore::SampleFormat>(sample_type);
++    const u32 bytes = channels * (format == AudioCore::SampleFormat::PcmInt16
++                                 ? sizeof(s16) : sizeof(f32));
++    const u64 minimum = AlignUp(0x1000 + AlignUp(0x40 + std::min<u64>(16, slots) * 8, 64) +
++                                   AlignUp(slots * bytes, 64), 0x1000);
++    R_UNLESS(p.size >= minimum && slots <= (p.size - PayloadOffset) / bytes,
++             ResultInsufficientBuffer);
++    R_UNLESS(p.state_event && p.data_event, ResultOutOfSessions);
++    u32 read{}, write{};
++    R_UNLESS(p.ReadIndex(ReadOffset, read) && p.ReadIndex(WriteOffset, write) &&
++                 read < slots && write < slots, ResultInvalidAddressInfo);
++    // Older audio sink has no special Sysmix stream type. Its existing Out path
++    // provides the same PCM16 queue, but no IsReady() health API.
++    p.host = p.sink.AcquireSinkStream(p.system, 2, "sysmix-" + std::to_string(p.id),
++                                     AudioCore::Sink::StreamType::Out);
++    R_UNLESS(p.host != nullptr, ResultOperationFailed);
++    p.host->SetRingSize(MaxSinkBlocks);
++    p.slots = static_cast<u32>(slots);
++    p.format = format;
++    p.frame_bytes = bytes;
++    p.consumer = read;
++    p.faulted = false;
++    p.open = true;
++    p.engaged = false;
++    p.gain = 1.0f;
++    p.copied_frames = p.accepted_frames = p.admitted_blocks = p.backpressure = p.faults = 0;
++    p.state_event->Signal(p.system.Kernel());
++    p.Notify(static_cast<u32>((write + slots - read) % slots));
++    LOG_INFO(Service_Audio, "sysmix {} opened using legacy Out sink: slots={} buffer={:#x}",
++             p.id, p.slots, p.buffer);
++    R_SUCCEED();
++}
++
++void SysmixOutput::Close() { impl->Close(); }
++
++Result SysmixOutput::SetEngaged(bool engaged) {
++    auto& p = *impl;
++    std::scoped_lock lock{p.mutex};
++    R_UNLESS(p.open && !p.faulted && p.host, ResultOperationFailed);
++    if (p.engaged == engaged) R_SUCCEED();
++    if (engaged) {
++        p.host->Start();
++        R_UNLESS(!p.host->IsPaused(), ResultOperationFailed);
++    } else {
++        p.host->Stop();
++        R_UNLESS(p.host->IsPaused(), p.Fault(ResultOperationFailed));
++    }
++    p.engaged = engaged;
++    if (p.state_event) p.state_event->Signal(p.system.Kernel());
++    R_SUCCEED();
++}
++
++Result SysmixOutput::SetDataNotification(u32 mode, s32 threshold) {
++    auto& p = *impl;
++    std::scoped_lock lock{p.mutex};
++    R_UNLESS(mode == 0 || mode == 2, ResultNotSupported);
++    R_UNLESS(p.open && !p.faulted && threshold >= 0 &&
++                 static_cast<u32>(threshold) < p.slots, ResultInvalidArgument);
++    u32 read{}, write{}, filled{};
++    R_UNLESS(p.ReadOccupancy(read, write, filled), p.Fault());
++    p.data_mode = mode;
++    p.threshold = threshold;
++    p.Notify(filled);
++    R_SUCCEED();
++}
++
++Result SysmixOutput::SetGain(f32 gain, s64 ramp_ns) {
++    R_UNLESS(ramp_ns == 0, ResultNotSupported);
++    R_UNLESS(std::isfinite(gain) && gain >= 0.0f && gain <= 128.0f, ResultInvalidArgument);
++    std::scoped_lock lock{impl->mutex};
++    impl->gain = gain;
++    R_SUCCEED();
++}
++
++f32 SysmixOutput::GetGain() const {
++    std::scoped_lock lock{impl->mutex};
++    return impl->gain;
++}
++
++u32 SysmixOutput::GetState() const {
++    std::scoped_lock lock{impl->mutex};
++    return impl->open && !impl->faulted ? (impl->engaged ? 2 : 1) : 0;
++}
++
++void SysmixOutput::Pump() {
++    auto& p = *impl;
++    std::unique_lock lock{p.mutex, std::try_to_lock};
++    if (!lock || !p.open || p.faulted || p.system.IsShuttingDown()) return;
++    u32 read{}, write{}, filled{};
++    if (!p.ReadOccupancy(read, write, filled)) { p.Fault(); return; }
++    if (!p.engaged) { p.Notify(filled); return; }
++    if (!p.host || p.host->IsPaused()) { p.Fault(ResultOperationFailed); return; }
++    // AppendBuffer in the older sink has no nonblocking API. Never call it with
++    // a full queue, which would otherwise risk blocking the emulator timer.
++    if (p.host->GetQueueSize() >= MaxSinkBlocks) {
++        ++p.backpressure;
++        return;
++    }
++    const u32 taken = std::min(filled, BlockFrames);
++    const u32 first = std::min(taken, p.slots - read);
++    const u32 second = taken - first;
++    auto& mem = p.process->GetMemory();
++    if ((first && !mem.ReadBlock(p.buffer + PayloadOffset + u64{read} * p.frame_bytes,
++                                  p.input.data(), first * p.frame_bytes)) ||
++        (second && !mem.ReadBlock(p.buffer + PayloadOffset,
++                                   p.input.data() + first * p.frame_bytes,
++                                   second * p.frame_bytes))) {
++        p.Fault(); return;
++    }
++    p.copied_frames += taken;
++    p.output.fill(0);
++    for (u32 frame = 0; frame < taken; ++frame) {
++        for (u32 channel = 0; channel < 2; ++channel) {
++            const u32 index = frame * 2 + channel;
++            f32 value;
++            if (p.format == AudioCore::SampleFormat::PcmInt16) {
++                s16 sample;
++                std::memcpy(&sample, p.input.data() + index * sizeof(sample), sizeof(sample));
++                value = static_cast<f32>(sample) / 32768.0f;
++            } else {
++                std::memcpy(&value, p.input.data() + index * sizeof(value), sizeof(value));
++            }
++            if (std::isfinite(value)) {
++                const auto sample = static_cast<s32>(
++                    std::clamp(value * p.gain, -1.0f, 1.0f) * 32768.0f);
++                p.output[index] = static_cast<s16>(std::clamp(sample, -32768, 32767));
++            }
++        }
++    }
++    AudioCore::Sink::SinkBuffer block{BlockFrames, 0, p.admitted_blocks, false};
++    p.host->AppendBuffer(block, std::span<s16>(p.output));
++    ++p.admitted_blocks;
++    const u32 next = (read + taken) % p.slots;
++    u32 checked{};
++    if (!p.ReadIndex(ReadOffset, checked) || checked != read ||
++        !mem.WriteExclusive32(p.buffer + ReadOffset, next, read) ||
++        !p.ReadIndex(ReadOffset, checked) || checked != next) {
++        p.Fault(); return;
++    }
++    p.consumer = next;
++    p.accepted_frames += taken;
++    if (!p.ReadOccupancy(read, write, filled)) { p.Fault(); return; }
++    p.Notify(filled);
++    if (p.admitted_blocks <= 3 || p.admitted_blocks % 400 == 0)
++        LOG_INFO(Service_Audio, "sysmix {} copied={} accepted={} blocks={} stalls={}",
++                 p.id, p.copied_frames, p.accepted_frames, p.admitted_blocks, p.backpressure);
++}
++
++Kernel::KReadableEvent* SysmixOutput::GetStateEvent() {
++    return impl->state_event ? &impl->state_event->GetReadableEvent() : nullptr;
++}
++Kernel::KReadableEvent* SysmixOutput::GetDataEvent() {
++    return impl->data_event ? &impl->data_event->GetReadableEvent() : nullptr;
++}
++bool SysmixOutput::IsOwnedBy(const Kernel::KProcess* process) const {
++    return impl->process.GetPointerUnsafe() == process;
++}
++} // namespace Service::Audio
+diff --git a/src/core/hle/service/audio/nx2_sysmix.h b/src/core/hle/service/audio/nx2_sysmix.h
+new file mode 100644
+index 0000000..ab3a36c
+--- /dev/null
++++ b/src/core/hle/service/audio/nx2_sysmix.h
+@@ -0,0 +1,36 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <memory>
++#include "common/common_types.h"
++#include "core/hle/result.h"
++
++namespace Core { class System; }
++namespace Kernel { class KProcess; class KReadableEvent; }
++namespace AudioCore::Sink { class Sink; }
++
++namespace Service::Audio {
++class SysmixOutput {
++public:
++    SysmixOutput(Core::System& system, Kernel::KProcess& process, AudioCore::Sink::Sink& sink,
++                 u32 id, u64 buffer, u64 size, u32 creation_flags);
++    ~SysmixOutput();
++    static Result ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 size, u32 creation_flags);
++    static bool IsFormatSupported(u32 sample_type, u32 channels, u32 rate);
++    Result Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u32 prefill, u32 flags);
++    void Close();
++    Result SetEngaged(bool engaged);
++    Result SetDataNotification(u32 mode, s32 threshold);
++    Result SetGain(f32 gain, s64 ramp_ns);
++    f32 GetGain() const;
++    u32 GetState() const;
++    void Pump();
++    Kernel::KReadableEvent* GetStateEvent();
++    Kernel::KReadableEvent* GetDataEvent();
++    bool IsOwnedBy(const Kernel::KProcess* process) const;
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl;
++};
++} // namespace Service::Audio
