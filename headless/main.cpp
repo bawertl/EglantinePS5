@@ -1170,14 +1170,15 @@ int main(int argc, char** argv) {
             // switch off for the game, every one of them is in it.
             const u64 title = eden_game_title_id(guest);
             {
-                // Donkey Kong Bananza's update needs its HMMA compute shaders expanded in software
-                // (patch 0009); other titles keep skipping them, as Mario Kart World's frame rate
-                // was measured. A value from env.txt wins.
+                // Donkey Kong Bananza and Switch 2 Zelda (Ocarina of Time) need HMMA compute
+                // passes on PS5/RADV without native cooperative matrices. The existing 0009/0013
+                // software path is enabled only for these title IDs; env.txt overrides it.
                 static bool soft_hmma_by_port = false;
-                if (title == 0x040074A01BF12000ULL) {
+                if (title == 0x040074A01BF12000ULL || title == 0x0400486024DEC000ULL) {
                     if (std::getenv("EDEN_NX2_SOFT_HMMA") == nullptr) {
                         setenv("EDEN_NX2_SOFT_HMMA", "1", 1);
                         soft_hmma_by_port = true;
+                        LOG_INFO(Core, "[SHADER-FIX] EDEN_NX2_SOFT_HMMA enabled for title={:016x}", title);
                     }
                 } else if (soft_hmma_by_port) {
                     unsetenv("EDEN_NX2_SOFT_HMMA");
