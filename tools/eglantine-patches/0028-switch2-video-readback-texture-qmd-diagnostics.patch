@@ -1,7 +1,7 @@
 diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
 --- a/src/video_core/nx2.h
 +++ b/src/video_core/nx2.h
-@@ -22,2 +22,45 @@
+@@ -22,4 +22,47 @@
  // The running title, for the few places that must behave differently per game.
  inline std::atomic<u64> g_nx2_program_id{0};
 +
@@ -47,6 +47,8 @@ diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
 +    }
 +    return false;
 +}
+ 
+ // Titles whose guest side reads GPU-written buffer data through a path the buffer cache does not
 diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
 --- a/src/core/hle/service/nx2_gsv.h
 +++ b/src/core/hle/service/nx2_gsv.h
