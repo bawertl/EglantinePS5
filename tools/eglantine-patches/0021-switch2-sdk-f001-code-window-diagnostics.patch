@@ -1,0 +1,89 @@
+diff --git a/src/core/hle/kernel/svc/svc_exception.cpp b/src/core/hle/kernel/svc/svc_exception.cpp
+--- a/src/core/hle/kernel/svc/svc_exception.cpp
++++ b/src/core/hle/kernel/svc/svc_exception.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cctype>
++#include <limits>
+ #include "core/core.h"
+ #include "core/debugger/debugger.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -15,6 +16,67 @@
+ #include "core/reporter.h"
+ 
+ namespace Kernel::Svc {
++
++// V1.000.006: read-only guest ARM64 code capture on a real 0xF001 svcBreak.
++// Backtrace already logs the general-purpose registers; capture only the
++// missing instruction bytes around the panic PC and the caller LR.
++// This neither alters the guest code nor creates NSO dumps on disk.
++void LogSdkPanicCodeWindows(Core::System& system, u64 debug_addr, u64 debug_size) {
++    if (debug_addr == 0 || debug_size != sizeof(u32)) {
++        return;
++    }
++
++    auto& memory = GetCurrentMemory(system.Kernel());
++    if (!memory.IsValidVirtualAddressRange(debug_addr, sizeof(u32))) {
++        return;
++    }
++    u32 debug_code{};
++    if (!memory.ReadBlock(debug_addr, &debug_code, sizeof(debug_code)) ||
++        debug_code != 0xF001) {
++        return;
++    }
++
++    ThreadContext context{};
++    system.CurrentPhysicalCore().GetContext(context);
++    LOG_CRITICAL(Debug_Emulated,
++                 "SDK_PANIC_DIAG 0xF001 PC={:#018x} LR={:#018x} (raw guest AArch64 words)",
++                 context.pc, context.lr);
++
++    const auto dump = [&](const char* window, u64 center, u64 before, u64 after) {
++        if ((center & 3) != 0 || center < before ||
++            center > (std::numeric_limits<u64>::max)() - after) {
++            LOG_CRITICAL(Debug_Emulated, "SDK_PANIC_DIAG {} invalid center={:#x}",
++                         window, center);
++            return;
++        }
++        const u64 start = center - before;
++        const u64 size = before + after + sizeof(u32);
++        if (!memory.IsValidVirtualAddressRange(start, size)) {
++            LOG_CRITICAL(Debug_Emulated,
++                         "SDK_PANIC_DIAG {} unmapped start={:#018x} size={:#x}",
++                         window, start, size);
++            return;
++        }
++        LOG_CRITICAL(Debug_Emulated,
++                     "SDK_PANIC_DIAG {} start={:#018x} end={:#018x} inclusive",
++                     window, start, center + after);
++        for (u64 offset = 0; offset < size; offset += sizeof(u32)) {
++            u32 instruction{};
++            if (!memory.ReadBlock(start + offset, &instruction, sizeof(instruction))) {
++                LOG_CRITICAL(Debug_Emulated,
++                             "SDK_PANIC_DIAG {} unreadable address={:#018x}",
++                             window, start + offset);
++                return;
++            }
++            LOG_CRITICAL(Debug_Emulated, "SDK_PANIC_DIAG {} {:#018x}: {:08x}",
++                         window, start + offset, instruction);
++        }
++    };
++    // Previous logs identify LR as sdk+0xBC03C and PC as sdk+0x1A5564.
++    // Addresses remain ASLR-relative; calculate from the actual live context.
++    dump("CALLER_LR", context.lr, 0x2C, 0x24);
++    dump("PANIC_PC", context.pc, 0x14, 0x1C);
++}
+ 
+ /// Break program execution
+ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
+@@ -55,6 +117,9 @@
+         LOG_CRITICAL(Debug_Emulated, "Userspace PANIC! info1={:#016x}, info2={:#016x}", info1,
+                      info2);
+         handle_debug_buffer(info1, info2);
++        if (!notification_only) {
++            LogSdkPanicCodeWindows(system, info1, info2);
++        }
+         break;
+     case BreakReason::Assert:
+         LOG_CRITICAL(Debug_Emulated, "Userspace Assertion failed! info1={:#016x}, info2={:#016x}",

@@ -1,4 +1,4 @@
-# NUP integration (experimental, v1.000.005)
+# NUP integration (experimental, v1.000.006)
 
 **Base:** EglantinePS5 `main` ZIP supplied by the user, with `Eglantine` gitlink pinned at
 `3140648a668aaebf87bae2dea17512fdca125ba0`. **Source of the NUP parser and loader:**
@@ -164,3 +164,44 @@ against a representative post-0019 fixture; ZIP CRC and changed-file audit.
 checkout, PS5 C++ toolchain build, real hardware boot/audio test. Run GitHub
 Actions Release on `feature/native-nup-loader` and inspect compile errors
 before testing on the PS5.
+
+## V1.000.006: Read-only SDK 0xF001 panic code-window capture
+
+The controlled real-console V1.000.005 tests (TV and Handheld, with frame
+ generation disabled) reproduced `SetTerminateResult 0xF001` and `svcBreak`
+with identical relative offsets `sdk+0x1A5564` (PC) and `sdk+0xBC03C` (LR).
+These offsets describe the observed SDK abort path, **not** a proven cause.
+The existing backtrace already captures PC, LR, SP and X0-X30, and the
+`svcBreak` handler already logs the four-byte `0xF001` buffer. Therefore this
+version does **not** duplicate the register dump or guess SDK assertion strings.
+
+Patch `0021-switch2-sdk-f001-code-window-diagnostics.patch` is applied after
+`0020` and changes **only**
+`src/core/hle/kernel/svc/svc_exception.cpp` in the pinned Lichii submodule.
+The diagnostic triggers only for a non-notification `BreakReason::Panic` whose
+four-byte guest debug buffer can be read and equals `0xF001`. The handler
+captures the live ARM CPU context, and safely checks guest virtual-memory
+mapping and each read. It logs two windows of **raw 32-bit little-endian ARM64
+instruction words** with guest virtual addresses (no binary dumping, no
+disassembly, no mutation or code patches):
+
+- `CALLER_LR`: LR minus `0x2C` through LR plus `0x24`, inclusive (21 words).
+  If LR still corresponds to `sdk+0xBC03C`, this is `sdk+0xBC010..0xBC060`.
+- `PANIC_PC`: PC minus `0x14` through PC plus `0x1C`, inclusive (13 words).
+  If PC still corresponds to `sdk+0x1A5564`, this is `sdk+0x1A5550..0x1A5580`.
+
+Filter the new `eden_log.txt` for `SDK_PANIC_DIAG`. The output includes each
+window address and raw opcode. A future offline ARM64 disassembly of these
+words can confirm local branches and control flow; it **cannot on its own**
+identify a failed IPC service or SDK source symbol without more evidence.
+An `unmapped`/`unreadable` diagnostic line is an intentional guarded outcome.
+If no `0xF001` occurs, there will be no `SDK_PANIC_DIAG` lines.
+
+No changes to game or SDK code, NSP/XCI/NUP loading, PS5 App-ID, audio services,
+Vulkan, JIT, core gitlink or older patches. The actual root cause of `0xF001`
+is still unknown; frame generation is not required for the panic to occur.
+
+**Validation completed:** patch applies and reverses on a pinned-commit source
+fixture (the prior patches do not touch this file); isolated C++20 smoke test
+of the capture logic and its failure guards; delta audit and ZIP CRC checks.
+**Not yet validated:** complete PS5 toolchain build / real-console run.
