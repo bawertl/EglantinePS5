@@ -1,0 +1,17 @@
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -190,6 +190,13 @@
+     if (!m_codec) {
+         m_codec = avcodec_find_decoder(av_codec);
+     }
++    if (av_codec == AV_CODEC_ID_AV1) {
++        const AVCodec* const software = avcodec_find_decoder_by_name("libdav1d");
++        LOG_INFO(HW_GPU, "[AV1-DIAG] libdav1d available={} name={}",
++                 software != nullptr, software ? software->name : "none");
++        // Never fall back to a hardware-only native AV1 decoder on PS5.
++        m_codec = software;
++    }
+     if (av_codec == AV_CODEC_ID_AV1) {
+         LOG_INFO(HW_GPU, "[AV1-DIAG] PS5 FFmpeg AV1 software decoder: found={}, name={}",
+                  m_codec != nullptr, m_codec ? m_codec->name : "none");

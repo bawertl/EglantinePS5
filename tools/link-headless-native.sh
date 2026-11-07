@@ -20,6 +20,15 @@ for argument in "$@"; do
         *) libraries+=("$argument") ;;
     esac
 done
+# FFmpeg::libdav1d is statically linked. Keep it in the same archive group
+# as libavcodec to resolve decoder entrypoints independently of archive order.
+dav1d_archive=""
+if [[ -f "$root/.local/headless-cache" ]]; then
+    dav1d_archive="$(cat "$root/.local/headless-cache")/dav1d-native/install/lib/libdav1d.a"
+fi
+[[ -n "$dav1d_archive" && -s "$dav1d_archive" ]] || {
+    echo 'Native PS5 link requires libdav1d.a' >&2; exit 1;
+}
 radv_link_flags=()
 radv_link_inputs=()
 tls_flags=(--defsym=__cxa_thread_atexit_impl=0)
@@ -54,7 +63,7 @@ fi
     --wrap=flockfile --wrap=funlockfile --wrap=open --wrap=close --wrap=read --wrap=pread --wrap=lseek \
     --wrap=fstat --wrap=stat --wrap=lstat \
     --wrap=sceKernelAllocateDirectMemory --wrap=sceKernelReleaseDirectMemory \
-    -o "$output" --start-group "${libraries[@]}" "${radv_link_inputs[@]}" \
+    -o "$output" --start-group "${libraries[@]}" "$dav1d_archive" "${radv_link_inputs[@]}" \
     "$sdk/target/lib/libc++.a" "$sdk/target/lib/libc++abi.a" "$sdk/target/lib/libunwind.a" \
     --end-group --as-needed "$sdk/target/lib/libSceLibcInternal.so" "$sdk/target/lib/libkernel.so" \
     "$sdk/target/lib/libc.a" "$sdk/target/lib/libSceNet.so"

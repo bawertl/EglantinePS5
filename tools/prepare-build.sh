@@ -45,19 +45,24 @@ if [[ ! -f $scratch/sdk/.complete ]]; then
     cp -a ../ps5-native-app-boilerplate/.deps/native/ps5-payload-sdk/target "$scratch/sdk/"
     touch "$scratch/sdk/.complete"
 fi
-# An older cache may have been built without AV1. One-time rebuild on upgrade;
-# the marker is written only after the AV1-enabled FFmpeg build succeeds.
-if [[ ! -f $scratch/ffmpeg-native/install/lib/libavcodec.a ||
-      ! -f $scratch/ffmpeg-native/install/.bgh-av1-enabled ]]; then
-    step "FFmpeg for the PS5 (AV1-enabled)"
-    bash tools/build-headless-ffmpeg.sh
-    touch "$scratch/ffmpeg-native/install/.bgh-av1-enabled"
+# The native FFmpeg AV1 symbol can exist even when it refuses software frames.
+# Use the pinned dav1d software decoder instead; avoid stale native-AV1 cache.
+if [[ ! -s $scratch/dav1d-native/install/lib/libdav1d.a ]]; then
+    step "dav1d AV1 software decoder for PS5"
+    bash tools/fetch-dav1d.sh
+    bash tools/build-headless-dav1d.sh
 fi
-# Confirm that the selected static decoder was really included, not just the header enum.
-if ! llvm-nm-18 "$scratch/ffmpeg-native/install/lib/libavcodec.a" 2>/dev/null | grep 'ff_av1_decoder' >/dev/null; then
-    echo 'PS5 FFmpeg: ff_av1_decoder symbol missing after AV1 build' >&2
+if [[ ! -f $scratch/ffmpeg-native/install/lib/libavcodec.a ||
+      ! -f $scratch/ffmpeg-native/install/.bgh-dav1d-enabled ]]; then
+    step "FFmpeg for PS5 (libdav1d-enabled)"
+    bash tools/build-headless-ffmpeg.sh
+    touch "$scratch/ffmpeg-native/install/.bgh-dav1d-enabled"
+fi
+if ! llvm-nm-18 "$scratch/ffmpeg-native/install/lib/libavcodec.a" 2>/dev/null | grep 'ff_libdav1d_decoder' >/dev/null; then
+    echo 'PS5 FFmpeg: ff_libdav1d_decoder missing; hardware-only AV1 is insufficient' >&2
     exit 1
 fi
+step "AV1 SOFTWARE CHECK: libdav1d static decoder present"
 step "Native packaging tool"
 bash tools/build-native-tool.sh
 # The app's runtime libc.prx: the boilerplate's clean-room build, checked against its recorded digest.
