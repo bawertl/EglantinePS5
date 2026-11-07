@@ -1,7 +1,7 @@
 diff --git a/src/video_core/host1x/nx2_video_decoder.cpp b/src/video_core/host1x/nx2_video_decoder.cpp
 --- a/src/video_core/host1x/nx2_video_decoder.cpp
 +++ b/src/video_core/host1x/nx2_video_decoder.cpp
-@@ -1,4 +1,24 @@
+@@ -137,4 +137,24 @@
              ++decoded_frames;
 +            if (decoded_frames <= 3 || decoded_frames % 600 == 0) {
 +                // The first plane is luma for the expected AV1 YUV formats. Never dereference
@@ -29,7 +29,7 @@ diff --git a/src/video_core/host1x/nx2_video_decoder.cpp b/src/video_core/host1x
 diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
 --- a/src/core/hle/service/nx2_gsv.h
 +++ b/src/core/hle/service/nx2_gsv.h
-@@ -1,5 +1,12 @@
+@@ -2098,5 +2098,12 @@
 +        const bool trace_image = m_frames_out < 3 || (m_frames_out % 600) == 0;
          if (!frame.picture || decoder == nullptr || address == 0 ||
              system.ApplicationProcess() == nullptr) {
@@ -42,7 +42,7 @@ diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
              return {std::min(m_width, layout.width), std::min(m_height, layout.height)};
          }
          // A frame larger than the image is scaled down to it.
-@@ -8,6 +15,21 @@
+@@ -2105,6 +2112,21 @@
          bytes.resize(layout.size);
          decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
                          layout.chroma_offset, bytes);
@@ -64,7 +64,7 @@ diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
          DumpFrame(bytes, layout, width, height);
          auto& memory = system.ApplicationMemory();
          if (layout.block_linear) {
-@@ -16,6 +38,10 @@
+@@ -2113,6 +2135,10 @@
                                             0, 0, width, height, layout.gob_height_log2, 0,
                                             static_cast<u32>(layout.pitch), true);
              memory.WriteBlock(address, tiled_bytes.data(), tiled_bytes.size());
@@ -75,7 +75,7 @@ diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
              return {width, height};
          }
          memory.WriteBlock(address, bytes.data(), layout.pitch * height);
-@@ -23,4 +49,8 @@
+@@ -2120,4 +2146,8 @@
              memory.WriteBlock(address + layout.chroma_offset, bytes.data() + layout.chroma_offset,
                                layout.pitch * ((height + 1) / 2));
          }
