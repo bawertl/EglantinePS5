@@ -1,0 +1,86 @@
+diff --git a/src/video_core/host1x/nx2_video_decoder.cpp b/src/video_core/host1x/nx2_video_decoder.cpp
+--- a/src/video_core/host1x/nx2_video_decoder.cpp
++++ b/src/video_core/host1x/nx2_video_decoder.cpp
+@@ -1,4 +1,24 @@
+             ++decoded_frames;
++            if (decoded_frames <= 3 || decoded_frames % 600 == 0) {
++                // The first plane is luma for the expected AV1 YUV formats. Never dereference
++                // a missing/negative-stride plane or an out-of-range pixel.
++                if (f->data[0] != nullptr && f->linesize[0] > 0 && f->width > 0 && f->height > 0 &&
++                    f->width <= f->linesize[0]) {
++                    const size_t center = static_cast<size_t>(f->height / 2) *
++                                          static_cast<size_t>(f->linesize[0]) +
++                                          static_cast<size_t>(f->width / 2);
++                    const u8 center_y = f->data[0][center];
++                    const u8 corner_y = f->data[0][0];
++                    LOG_INFO(HW_GPU,
++                             "[PIXEL-DIAG] decoded={} pts={} fmt={} {}x{} stride={} y_center={} y_corner={}",
++                             decoded_frames, pts, f->format, f->width, f->height,
++                             f->linesize[0], center_y, corner_y);
++                } else {
++                    LOG_WARNING(HW_GPU,
++                                "[PIXEL-DIAG] decoded={} no safely sampleable plane0: {}x{} stride={}",
++                                decoded_frames, f->width, f->height, f->linesize[0]);
++                }
++            }
+             if (decoded_frames <= 3 || decoded_frames % 120 == 0) {
+                 LOG_INFO(HW_GPU, "[AV1-DIAG] decoded frame={} width={} height={} pts={}",
+                          decoded_frames, f->width, f->height, pts);
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1,5 +1,12 @@
++        const bool trace_image = m_frames_out < 3 || (m_frames_out % 600) == 0;
+         if (!frame.picture || decoder == nullptr || address == 0 ||
+             system.ApplicationProcess() == nullptr) {
++            if (trace_image) {
++                LOG_WARNING(Service,
++                            "[GPU-MAP-DIAG] skipped image={} addr={:#x} picture={} decoder={} process={}",
++                            image_id, address, frame.picture.has_value(), decoder != nullptr,
++                            system.ApplicationProcess() != nullptr);
++            }
+             return {std::min(m_width, layout.width), std::min(m_height, layout.height)};
+         }
+         // A frame larger than the image is scaled down to it.
+@@ -8,6 +15,21 @@
+         bytes.resize(layout.size);
+         decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
+                         layout.chroma_offset, bytes);
++        if (trace_image) {
++            // Check the converted image too; only sample when the row/pixel is within bytes.
++            const u64 pixel_size = layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 ? 1 : 4;
++            const u64 center = (static_cast<u64>(height / 2) * layout.pitch) +
++                               (static_cast<u64>(width / 2) * pixel_size);
++            const bool safe_sample = height > 0 && width > 0 &&
++                                     pixel_size * width <= layout.pitch && center < bytes.size();
++            LOG_INFO(Service,
++                     "[GPU-MAP-DIAG] image={} guest_addr={:#x} size={:#x} {}x{} pitch={} "
++                     "chroma_off={:#x} fmt={} tiled={} sample_ok={} sample_center={} sample_corner={}",
++                     image_id, address, layout.size, width, height, layout.pitch,
++                     layout.chroma_offset, static_cast<u32>(layout.format), layout.block_linear,
++                     safe_sample, safe_sample ? bytes[static_cast<size_t>(center)] : u8{},
++                     safe_sample ? bytes[0] : u8{});
++        }
+         DumpFrame(bytes, layout, width, height);
+         auto& memory = system.ApplicationMemory();
+         if (layout.block_linear) {
+@@ -16,6 +38,10 @@
+                                            0, 0, width, height, layout.gob_height_log2, 0,
+                                            static_cast<u32>(layout.pitch), true);
+             memory.WriteBlock(address, tiled_bytes.data(), tiled_bytes.size());
++            if (trace_image) {
++                LOG_INFO(Service, "[GPU-MAP-DIAG] image={} wrote block-linear bytes={}",
++                         image_id, tiled_bytes.size());
++            }
+             return {width, height};
+         }
+         memory.WriteBlock(address, bytes.data(), layout.pitch * height);
+@@ -23,4 +49,8 @@
+             memory.WriteBlock(address + layout.chroma_offset, bytes.data() + layout.chroma_offset,
+                               layout.pitch * ((height + 1) / 2));
+         }
++        if (trace_image) {
++            LOG_INFO(Service, "[GPU-MAP-DIAG] image={} wrote pitch-linear luma_rows={} fmt={}",
++                     image_id, height, static_cast<u32>(layout.format));
++        }
+         return {width, height};
