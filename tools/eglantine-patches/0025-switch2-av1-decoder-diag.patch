@@ -1,0 +1,89 @@
+diff --git a/src/video_core/host1x/nvdec_common.h b/src/video_core/host1x/nvdec_common.h
+--- a/src/video_core/host1x/nvdec_common.h
++++ b/src/video_core/host1x/nvdec_common.h
+@@ -24,3 +24,4 @@
+     H265 = 0x7,
+     VP9 = 0x9,
++    AV1 = 0xA,
+ };
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -163,3 +163,5 @@
+         case Tegra::Host1x::NvdecCommon::VideoCodec::VP9:
+             return AV_CODEC_ID_VP9;
++        case Tegra::Host1x::NvdecCommon::VideoCodec::AV1:
++            return AV_CODEC_ID_AV1;
+         default:
+@@ -189,5 +189,9 @@
+     if (!m_codec) {
+         m_codec = avcodec_find_decoder(av_codec);
++    }
++    if (av_codec == AV_CODEC_ID_AV1) {
++        LOG_INFO(HW_GPU, "[AV1-DIAG] PS5 FFmpeg AV1 software decoder: found={}, name={}",
++                 m_codec != nullptr, m_codec ? m_codec->name : "none");
+     }
+ }
+ 
+diff --git a/src/video_core/host1x/nx2_video_decoder.cpp b/src/video_core/host1x/nx2_video_decoder.cpp
+--- a/src/video_core/host1x/nx2_video_decoder.cpp
++++ b/src/video_core/host1x/nx2_video_decoder.cpp
+@@ -6,6 +6,7 @@
+ #include <cstring>
+ #include <optional>
+ #include <set>
++#include <string>
+ #include <string_view>
+ 
+ #include "common/logging.h"
+@@ -32,2 +32,6 @@
+ std::optional<NvdecCommon::VideoCodec> CodecFromMime(std::string_view mime) {
++    if (mime.find("av01") != std::string_view::npos ||
++        mime.find("av1") != std::string_view::npos) {
++        return NvdecCommon::VideoCodec::AV1;
++    }
+     if (mime.find("vp9") != std::string_view::npos) {
+@@ -101,3 +101,5 @@
+     std::vector<u8> packet; ///< FFmpeg reads up to AV_INPUT_BUFFER_PADDING_SIZE past the data
++    u64 decoded_frames{};
++    u64 submitted_packets{};
+ 
+     ~Impl() {
+@@ -115,3 +115,8 @@
++            ++decoded_frames;
++            if (decoded_frames <= 3 || decoded_frames % 120 == 0) {
++                LOG_INFO(HW_GPU, "[AV1-DIAG] decoded frame={} width={} height={} pts={}",
++                         decoded_frames, f->width, f->height, pts);
++            }
+             pictures.push_back({static_cast<u32>(f->width), static_cast<u32>(f->height), pts,
+                                 std::move(frame)});
+         }
+@@ -138,5 +138,17 @@
+     if (!parsed) {
+-        LOG_ERROR(HW_GPU, "nx2 video: unsupported {}-byte codec configuration", configuration.size());
++        // Record actual guest bytes. A 10-byte configuration is not proof of AV1.
++        static constexpr char digits[] = "0123456789abcdef";
++        std::string ascii;
++        std::string hex;
++        for (const u8 byte : configuration.first(std::min(configuration.size(), size_t{64}))) {
++            ascii.push_back(byte >= 32 && byte <= 126 ? static_cast<char>(byte) : '.');
++            hex.push_back(digits[byte >> 4]);
++            hex.push_back(digits[byte & 0xf]);
++        }
++        LOG_ERROR(HW_GPU, "[AV1-DIAG] unsupported codec config size={} ascii='{}' hex={}",
++                  configuration.size(), ascii, hex);
+         return;
+     }
++    LOG_INFO(HW_GPU, "[AV1-DIAG] detected codec={} config_bytes={}",
++             static_cast<u64>(parsed->codec), configuration.size());
+     impl->decoder.emplace(parsed->codec);
+@@ -177,4 +177,9 @@
+     if (!impl->open || data.empty()) {
+         return;
+     }
++    ++impl->submitted_packets;
++    if (impl->submitted_packets <= 3 || impl->submitted_packets % 120 == 0) {
++        LOG_INFO(HW_GPU, "[AV1-DIAG] packet={} bytes={} pts={} decoded_so_far={}",
++                 impl->submitted_packets, data.size(), pts, impl->decoded_frames);
++    }
+     impl->packet.assign(data.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);

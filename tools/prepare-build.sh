@@ -45,9 +45,18 @@ if [[ ! -f $scratch/sdk/.complete ]]; then
     cp -a ../ps5-native-app-boilerplate/.deps/native/ps5-payload-sdk/target "$scratch/sdk/"
     touch "$scratch/sdk/.complete"
 fi
-if [[ ! -f $scratch/ffmpeg-native/install/lib/libavcodec.a ]]; then
-    step "FFmpeg for the PS5"
+# An older cache may have been built without AV1. One-time rebuild on upgrade;
+# the marker is written only after the AV1-enabled FFmpeg build succeeds.
+if [[ ! -f $scratch/ffmpeg-native/install/lib/libavcodec.a ||
+      ! -f $scratch/ffmpeg-native/install/.bgh-av1-enabled ]]; then
+    step "FFmpeg for the PS5 (AV1-enabled)"
     bash tools/build-headless-ffmpeg.sh
+    touch "$scratch/ffmpeg-native/install/.bgh-av1-enabled"
+fi
+# Confirm that the selected static decoder was really included, not just the header enum.
+if ! llvm-nm-18 "$scratch/ffmpeg-native/install/lib/libavcodec.a" 2>/dev/null | grep 'ff_av1_decoder' >/dev/null; then
+    echo 'PS5 FFmpeg: ff_av1_decoder symbol missing after AV1 build' >&2
+    exit 1
 fi
 step "Native packaging tool"
 bash tools/build-native-tool.sh
