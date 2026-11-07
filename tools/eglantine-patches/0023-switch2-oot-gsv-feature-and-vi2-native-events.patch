@@ -1,0 +1,158 @@
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -163,4 +163,6 @@
+             {103, &INx2SyncptSession::QueryCounter, "QueryCounter"},
+             {201, &INx2SyncptSession::RequestSlotEvent, "RequestSlotEvent (guessed)"},
+             {202, &INx2SyncptSession::CancelSlotEvent, "CancelSlotEvent (guessed)"},
++            // PC nightly 216d3e2: Unknown21 is a zeroed placeholder, NOT a wait implementation.
++            {21, &INx2SyncptSession::ReplyUnknown21Zeroed, "Unknown21"},
+         });
+@@ -187,3 +189,8 @@
+ private:
++    void ReplyUnknown21Zeroed(HLERequestContext& ctx) {
++        LOG_INFO(Service, "nx2:syncpt TIPC 21 explicit zeroed compatibility reply");
++        TipcReplyZeroed(ctx);
++    }
++
+     // Newer SDKs (title 1) open with TIPC 0(u64 token) and abort unless the reply echoes it.
+     void Handshake(HLERequestContext& ctx) {
+@@ -1076,4 +1083,15 @@
+-            // The original core already signals the 31/32 events every vblank;
+-            // 261 only acknowledges binding in this version's event model.
++            // The PC core treats 31/32 as indexed native event slots. 261 associates a
++            // slot with vblank; other odd commands bind one-shot display-change events.
+             {261, &INx2Vi2Session::BindVsyncCompat, "BindDisplayVsyncEvent"},
++            {262, &INx2Vi2Session::UnbindNativeEventCompat, "UnbindDisplayVsyncEvent"},
++            {263, &INx2Vi2Session::BindChangeCompat, "BindDisplayRefreshRateEvent"},
++            {264, &INx2Vi2Session::UnbindNativeEventCompat, "UnbindDisplayRefreshRateEvent"},
++            {265, &INx2Vi2Session::BindChangeCompat, "BindDisplayHdrStatusEvent"},
++            {266, &INx2Vi2Session::UnbindNativeEventCompat, "UnbindDisplayHdrStatusEvent"},
++            {267, &INx2Vi2Session::BindChangeCompat, "BindDisplayHdrPaperWhiteEvent"},
++            {268, &INx2Vi2Session::UnbindNativeEventCompat, "UnbindDisplayHdrPaperWhiteEvent"},
++            {269, &INx2Vi2Session::BindChangeCompat, "BindDisplayBufferMaxResolutionEvent"},
++            {270, &INx2Vi2Session::UnbindNativeEventCompat, "UnbindDisplayBufferMaxResolutionEvent"},
++            {271, &INx2Vi2Session::BindChangeCompat, "BindDisplayModeCapabilityEvent"},
++            {272, &INx2Vi2Session::UnbindNativeEventCompat, "UnbindDisplayModeCapabilityEvent"},
+             {301, &INx2Vi2Session::ReplyZeroedCompat, "Unknown301"},
+@@ -1120,9 +1138,41 @@
+     void BindVsyncCompat(HLERequestContext& ctx) {
+-        // In the legacy PS5 core GetVsyncEvent(31/32) already schedules vblank
+-        // signalling. Do not add a second timer or duplicate event ownership.
+-        LOG_INFO(Service, "nx2:vi2 TIPC 261 binding existing vsync event slot {}",
+-                 ctx.CommandBuffer()[4]);
++        const u32 index = ctx.CommandBuffer()[4];
++        LOG_INFO(Service, "nx2:vi2 TIPC 261 bind native event slot {} to vsync", index);
++        SetNativeEventVsync(index, true);
+         TipcReplyWords(ctx, {});
+     }
+ 
++    void BindChangeCompat(HLERequestContext& ctx) {
++        const u32 index = ctx.CommandBuffer()[4];
++        LOG_INFO(Service, "nx2:vi2 TIPC {} bind native event slot {} to display change",
++                 ctx.GetCommand(), index);
++        SetNativeEventVsync(index, false);
++        if (index < m_native_events.size() && m_native_events[index] != nullptr) {
++            m_native_events[index]->Signal(system.Kernel());
++        }
++        TipcReplyWords(ctx, {});
++    }
++
++    void UnbindNativeEventCompat(HLERequestContext& ctx) {
++        const u32 index = ctx.CommandBuffer()[4];
++        LOG_DEBUG(Service, "nx2:vi2 TIPC {} unbind native event slot {}", ctx.GetCommand(), index);
++        SetNativeEventVsync(index, false);
++        TipcReplyWords(ctx, {});
++    }
++
++    void SetNativeEventVsync(u32 index, bool enabled) {
++        if (index >= m_native_events.size() || m_native_events[index] == nullptr) {
++            return;
++        }
++        auto* const event = m_native_events[index];
++        std::scoped_lock lk{m_vsync->mutex};
++        auto& events = m_vsync->events;
++        const auto it = std::find(events.begin(), events.end(), event);
++        if (enabled && it == events.end()) {
++            events.push_back(event);
++        } else if (!enabled && it != events.end()) {
++            events.erase(it);
++        }
++    }
++
+     void ReplyZeroedCompat(HLERequestContext& ctx) {
+@@ -1528,13 +1578,28 @@
+-    // 31(u32 kind) and 32(u32 display): events signalled on every vblank. Title 1's main thread
+-    // waits on the 32 event until it has fired twice before it submits any GPU work, and hung
+-    // there while it never fired.
++    // 31(u32 slot) acquires the event for a native slot. 32(copy handle,u32 slot) returns
++    // the SAME event; the copy-handle descriptor precedes the slot index in this request.
++    // The old code allocated two distinct events, unlike the functioning PC implementation.
+     void GetVsyncEvent(HLERequestContext& ctx) {
+-        LOG_INFO(Service, "nx2:vi2 {} vsync event, [2]={:#x}", ctx.GetCommand(), ctx.CommandBuffer()[2]);
+-        auto* event = m_context.CreateEvent(fmt::format("nx2:vi2:Vsync{}", m_events.size()));
+-        m_events.push_back(event);
+-        {
+-            std::scoped_lock lk{m_vsync->mutex};
+-            m_vsync->events.push_back(event);
++        const auto* const words = ctx.CommandBuffer();
++        u32 data = 2;
++        if (ctx.GetCommand() == 32 && (words[1] >> 31) != 0) {
++            const u32 descriptor = words[2];
++            data = 3 + ((descriptor >> 1) & 0xF) + ((descriptor >> 5) & 0xF) +
++                   ((descriptor & 1) != 0 ? 2 : 0);
++        }
++        const u32 index = words[data];
++        if (index >= m_native_events.size()) {
++            LOG_ERROR(Service, "nx2:vi2 TIPC {} native event index {} out of range",
++                      ctx.GetCommand(), index);
++            IPC::ResponseBuilder rb{ctx, 2};
++            rb.Push(ResultUnknown);
++            return;
++        }
++        LOG_INFO(Service, "nx2:vi2 TIPC {} native event slot {}", ctx.GetCommand(), index);
++        auto*& event = m_native_events[index];
++        if (event == nullptr) {
++            event = m_context.CreateEvent(fmt::format("nx2:vi2:Native{}", index));
++            m_events.push_back(event);
++            SetNativeEventVsync(index, true);
+         }
+         if (!m_vsync_timer) {
+             m_vsync_timer = Core::Timing::CreateEvent(
+@@ -1547,8 +1612,7 @@
+                     }
+                     return std::nullopt;
+                 });
+-            // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on this event, so a
+-            // frame that misses a 60 Hz tick idles until the next one.
++            // Keep the existing PS5 timer and its tick-frequency experiment unchanged.
+             static const std::chrono::nanoseconds VblankInterval{[] {
+                 const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
+                 const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
+@@ -1564,4 +1628,6 @@
+     KernelHelpers::ServiceContext m_context;
+     std::shared_ptr<Nx2NativeObjects> m_objects;
+     std::vector<Kernel::KEvent*> m_events;
++    // Native event slots are session-owned; duplicate cmd 32 returns the same event as cmd 31.
++    std::array<Kernel::KEvent*, 8> m_native_events{};
+     // Shared with the vsync timer callback, which can outlive the session by one call.
+@@ -2123,5 +2189,5 @@
+             {111, &INx2GraphicsSystemSession::CreateNativeMemory, "CreateNativeMemory"},
+             {112, &INx2GraphicsSystemSession::DestroyNativeMemory, "DestroyNativeMemory"},
+             {114, &INx2GraphicsSystemSession::BindNativeMemory, "BindNativeMemory"},
+-            {115, &INx2GraphicsSystemSession::ConfigureNativeMemory, "ConfigureNativeMemory"},
++            {115, &INx2GraphicsSystemSession::QueryGrantedFeatures, "QueryGrantedFeatures"},
+             {314, &INx2GraphicsSystemSession::ConfigureWindowImagePool, "DestroyNativeWindowAliasImagePool"},
+@@ -2420,5 +2486,8 @@
+-    // 115(u32 mode, u32): replies a u64 optional memory mode; 0 keeps the nvdrv-compatible path
+-    // (an empty reply leaves the request's mode word where the SDK reads it).
+-    void ConfigureNativeMemory(HLERequestContext& ctx) {
+-        TipcReplyWords(ctx, {0, 0});
++    // PC nightly 216d3e2: 115(u64 requested features) replies the granted subset.
++    // In the successful Zelda NUP trace the request is 0x2; replying {0,0} denied it.
++    void QueryGrantedFeatures(HLERequestContext& ctx) {
++        const auto* const w = ctx.CommandBuffer();
++        LOG_INFO(Service, "nx2:gsv TIPC 115 requested feature mask {:#x}",
++                 u64{w[2]} | (u64{w[3]} << 32));
++        TipcReplyWords(ctx, {w[2], w[3]});
+     }
