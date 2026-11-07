@@ -2,7 +2,7 @@ diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index de8bf61..4698ed7 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
-@@ -3,6 +3,8 @@
+@@ -530,6 +530,8 @@
      hle/service/audio/audio_renderer_manager.h
      hle/service/audio/nx2_audio_user_client.h
      hle/service/audio/nx2_audio_device_manager.h
@@ -15,14 +15,14 @@ diff --git a/src/core/hle/service/audio/audio.cpp b/src/core/hle/service/audio/a
 index 7ff67a6..a31c76f 100644
 --- a/src/core/hle/service/audio/audio.cpp
 +++ b/src/core/hle/service/audio/audio.cpp
-@@ -1,5 +1,6 @@
+@@ -186,5 +186,6 @@
  void LoopProcess(Core::System& system) {
      auto server_manager = std::make_unique<ServerManager>(system);
 +    auto sysmix = std::make_shared<Nx2SysmixStreams>(system);
  
      server_manager->RegisterNamedService("aud:a", std::make_shared<IAudioSystemManagerForApplet>(system), 30);
      server_manager->RegisterNamedService("aud:d", std::make_shared<IAudioSystemManagerForDebugger>(system), 30);
-@@ -21,7 +22,8 @@ void LoopProcess(Core::System& system) {
+@@ -206,7 +207,8 @@ void LoopProcess(Core::System& system) {
      server_manager->RegisterNamedService("audren:u", std::make_shared<IAudioRendererManager>(system), 30);
      // Switch 2 audio entry point (nn::audio::CreateUserClientSessionByHipc).
      server_manager->RegisterNamedService("aud:u", std::make_shared<INx2AudioUserClient>(system), 30);
