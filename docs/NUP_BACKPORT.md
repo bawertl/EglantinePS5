@@ -205,3 +205,48 @@ is still unknown; frame generation is not required for the panic to occur.
 fixture (the prior patches do not touch this file); isolated C++20 smoke test
 of the capture logic and its failure guards; delta audit and ZIP CRC checks.
 **Not yet validated:** complete PS5 toolchain build / real-console run.
+
+
+## V1.000.009: Switch 2 WaitIfEqual64 kernel backport and diagnostic
+
+Based on the pinned Lichii `3140648a668aaebf87bae2dea17512fdca125ba0`,
+patch `0024-switch2-wait-if-equal64-arb-diag.patch` adds the address arbiter
+`WaitIfEqual64` mode (arbitration type 3) from the functioning Windows Eglantine
+`216d3e294367abd4742d7ebd736ef25a8db6f365` kernel. The pinned PS5 core
+otherwise rejects type 3 with `ResultInvalidEnumValue` (`0xF001`). Whether that
+specific failure causes Zelda's SDK panic has **not been established**.
+
+The patch adjusts the type enum, the 8-byte address alignment, 64-bit guest
+memory comparison, the existing scheduler-lock-and-sleep wait path, the
+`KProcess` parameter, SVC declarations, the 64-bit dispatch wrapper's X2
+argument, and `tools/svc_generator.py` so regenerating the wrapper preserves
+64-bit argument semantics. The legacy 32-bit modes retain 32-bit comparisons;
+no new PS5-specific wait loop or custom thread/timer ownership is introduced.
+
+Diagnostic messages for the first 32 `WaitIfEqual64` SVC calls start with
+`[ARB-DIAG]` and include guest address, full 64-bit value, timeout, and (after
+the wait returns) kernel result. Unsupported arbitration types are logged as
+errors. An additional `[SVC-F001]` diagnostic records the SVC identifier
+and original input registers whenever a 64-bit Switch 2 SVC leaves X0 equal to
+`0xF001`; it can also reveal a different SVC returning that value. This is
+an X0 observation, not automatically proof of a kernel Result return for every
+SVC. **A logged call by itself does not prove the previous crash originated
+there.** A waiting thread may not produce a corresponding return line until
+signalled. The separate Zelda NSP loader failure is not modified in this update.
+
+Only patch 0024, this documentation and `sce_sys/param.json` are changed in the
+GitHub update ZIP. Existing patches 0001-0023, the pinned submodule commit,
+PS5 application ID, and PS5/launcher/renderer settings are unchanged.
+
+**Validation limitation:** The new patch was applied and reversed against
+fixtures assembled from source excerpts of the pinned commit and checked for
+structural consistency. The complete original Eglantine submodule and native
+PS5 toolchain are not included in the source backup, so application against a
+real checkout, C++ compilation, runtime SVC behavior, and Zelda boot must be
+checked with the GitHub Actions release build and on the console. If the build
+reports a patch conflict, do not force application or alter the pinned core.
+
+Test only the original NUP initially. Inspect `eden_log.txt` for `[ARB-DIAG]`, `[SVC-F001]`,
+`SetTerminateResult`, `Userspace PANIC`, `PresentClientBuffer` and the first
+frame. Absence of `[ARB-DIAG]` does not alone prove Zelda never calls type 3;
+confirm the configured log filter and ensure v1.000.009 is running.
