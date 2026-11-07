@@ -126,6 +126,14 @@ jobs:
       - name: Fetch dependencies
         run: make deps
 
+      # Cache the small, separately pinned dav1d source without invalidating the
+      # heavy RADV build (whose cache key intentionally follows tools/deps.json).
+      - name: Restore dav1d source
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .deps/dav1d-src
+          key: dav1d-src-b546257f770768b2c88258c533da38b91a06f737
+
       # Generated 0018 and the PS5 entry points must match the pinned NUP loader.
       - name: Verify experimental NUP backport
         run: |
