@@ -10,8 +10,29 @@ source="$scratch/source/.cache/cpm/ffmpeg/c7b5f1537d"
 test -f "$source/configure"
 dav1d="$scratch/dav1d-native/install"
 test -s "$dav1d/lib/libdav1d.a" || { echo "Build PS5 dav1d first" >&2; exit 1; }
-export PKG_CONFIG_LIBDIR="$dav1d/lib/pkgconfig"
+# Meson on FreeBSD installs pkg-config metadata in libdata/pkgconfig
+# (not necessarily lib/pkgconfig). Resolve the actual installed file.
+dav1d_pc=""
+for candidate in "$dav1d/libdata/pkgconfig/dav1d.pc" \
+                 "$dav1d/lib/pkgconfig/dav1d.pc" \
+                 "$dav1d/share/pkgconfig/dav1d.pc"; do
+    if [[ -f "$candidate" ]]; then
+        dav1d_pc="$candidate"
+        break
+    fi
+done
+[[ -n "$dav1d_pc" ]] || {
+    echo "ERROR: dav1d.pc not found in $dav1d (libdata/lib/share pkgconfig)" >&2
+    exit 1
+}
+export PKG_CONFIG_LIBDIR="$(dirname "$dav1d_pc")"
 export PKG_CONFIG_PATH=
+export PKG_CONFIG_SYSROOT_DIR=
+if ! pkg-config --atleast-version=1.0.0 dav1d; then
+    echo "ERROR: dav1d pkg-config lookup failed (file: $dav1d_pc)" >&2
+    exit 1
+fi
+echo "PS5 dav1d pkg-config: $(pkg-config --modversion dav1d) from $dav1d_pc"
 mkdir -p "$scratch/ffmpeg-native"
 cd "$scratch/ffmpeg-native"
 # Use the same pinned, minimal decoder set as the Linux core. Avoid the full
