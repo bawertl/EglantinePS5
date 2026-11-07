@@ -8,6 +8,8 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 mode=${1:-apply}
+check_err=$(mktemp)
+trap 'rm -f "$check_err"' EXIT
 shopt -s nullglob
 patches=("$root"/tools/eglantine-patches/*.patch)
 ((${#patches[@]})) || exit 0
@@ -19,7 +21,7 @@ patches=("$root"/tools/eglantine-patches/*.patch)
 # patches, built in a temporary index (the working tree is not touched).
 if [[ $mode != --revert ]]; then
     index=$(mktemp)
-    trap 'rm -f "$index"' EXIT
+    trap 'rm -f "$index" "$check_err"' EXIT
     mapfile -t touched < <(for patch in "${patches[@]}"; do git -C Eglantine apply --numstat "$patch"; done | cut -f3 | sort -u)
     applied=-1
     GIT_INDEX_FILE=$index git -C Eglantine read-tree HEAD
@@ -32,11 +34,16 @@ if [[ $mode != --revert ]]; then
     if ((applied >= 0)); then
         for patch in "${patches[@]:applied}"; do
             name=$(basename "$patch")
-            if git -C Eglantine apply --check "$patch" >/dev/null 2>&1; then
+            if git -C Eglantine apply --check "$patch" 2>"$check_err"; then
                 git -C Eglantine apply "$patch"
                 echo "Eglantine patch applied: $name"
             else
-                echo "Eglantine patch does not apply: $name (Eglantine moved; make the patch again)" >&2
+                echo "Eglantine patch does not apply: $name" >&2
+                echo "--- git apply --check diagnostics ---" >&2
+                cat "$check_err" >&2
+                echo "--- git apply --verbose diagnostics ---" >&2
+                git -C Eglantine apply --check --verbose "$patch" >&2 || true
+                echo "--- end patch diagnostics ---" >&2
                 exit 1
             fi
         done
@@ -56,11 +63,14 @@ for patch in "${patches[@]}"; do
         fi
     elif [[ $mode == --revert ]]; then
         echo "Eglantine patch not in: $name"
-    elif git -C Eglantine apply --check "$patch" >/dev/null 2>&1; then
+    elif git -C Eglantine apply --check "$patch" 2>"$check_err"; then
         git -C Eglantine apply "$patch"
         echo "Eglantine patch applied: $name"
     else
-        echo "Eglantine patch does not apply: $name (Eglantine moved; make the patch again)" >&2
+        echo "Eglantine patch does not apply: $name" >&2
+        echo "--- git apply --check diagnostics ---" >&2
+        cat "$check_err" >&2
+        git -C Eglantine apply --check --verbose "$patch" >&2 || true
         exit 1
     fi
 done
