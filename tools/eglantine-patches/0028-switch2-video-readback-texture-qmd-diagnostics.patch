@@ -1,0 +1,181 @@
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -22,2 +22,45 @@
+ // The running title, for the few places that must behave differently per game.
+ inline std::atomic<u64> g_nx2_program_id{0};
++
++// V1.000.013 diagnostic only: recent CPU/device address pairs of decoder image buffers.
++// This records addresses, but does not alter GPU mappings or shader execution.
++struct Nx2VideoDiagnosticRange {
++    std::atomic<u64> cpu{};
++    std::atomic<u64> gpu{};
++    std::atomic<u64> size{};
++};
++inline std::array<Nx2VideoDiagnosticRange, 16> g_nx2_video_diagnostic_ranges{};
++
++inline void Nx2RecordVideoDiagnosticRange(u64 cpu, u64 gpu, u64 size) {
++    if (cpu == 0 || size == 0) {
++        return;
++    }
++    auto& range = g_nx2_video_diagnostic_ranges[(cpu >> 12) %
++                                                g_nx2_video_diagnostic_ranges.size()];
++    range.size.store(0, std::memory_order_release);
++    range.cpu.store(cpu, std::memory_order_relaxed);
++    range.gpu.store(gpu, std::memory_order_relaxed);
++    range.size.store(size, std::memory_order_release);
++}
++
++inline bool Nx2MatchesVideoDiagnosticRange(u64 cpu, u64 gpu, u64 size) {
++    if (size == 0) {
++        return false;
++    }
++    const auto overlaps = [](u64 first, u64 length, u64 candidate, u64 candidate_size) {
++        return first != 0 && candidate != 0 &&
++               (first <= candidate ? candidate - first < length
++                                   : first - candidate < candidate_size);
++    };
++    for (const auto& range : g_nx2_video_diagnostic_ranges) {
++        const u64 length = range.size.load(std::memory_order_acquire);
++        if (length == 0) {
++            continue;
++        }
++        if (overlaps(range.cpu.load(std::memory_order_relaxed), length, cpu, size) ||
++            overlaps(range.gpu.load(std::memory_order_relaxed), length, gpu, size)) {
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -2375,3 +2375,26 @@
+         DumpFrame(bytes, layout, width, height);
+         auto& memory = system.ApplicationMemory();
++        if (trace_image) {
++            // Query the actual device/SMMU mapping; CPU guest addresses need not equal GPU addresses.
++            const auto device_address =
++                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
++            const u64 luma_bytes = layout.pitch * static_cast<u64>(height);
++            const u64 uv_bytes = layout.pitch * ((static_cast<u64>(height) + 1) / 2);
++            const bool nv12 = layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12;
++            const bool layout_ok = luma_bytes <= layout.size &&
++                                   (!nv12 || (layout.chroma_offset >= luma_bytes &&
++                                              layout.chroma_offset <= layout.size &&
++                                              uv_bytes <= layout.size - layout.chroma_offset));
++            LOG_INFO(Service,
++                     "[LAYOUT-DIAG] image={} cpu={:#x} device_gpu={:#x} mapped={} "
++                     "size={:#x} luma={:#x} chroma_off={:#x} chroma_bytes={:#x} "
++                     "pitch={} height={} nv12={} valid={}",
++                     image_id, address, device_address.value_or(0),
++                     device_address.has_value(), layout.size, luma_bytes, layout.chroma_offset,
++                     nv12 ? uv_bytes : u64{}, layout.pitch, height, nv12, layout_ok);
++            if (layout_ok) {
++                Tegra::Nx2RecordVideoDiagnosticRange(address, device_address.value_or(0),
++                                                     layout.size);
++            }
++        }
+         if (layout.block_linear) {
+@@ -2395,5 +2418,38 @@
+         if (trace_image) {
+             LOG_INFO(Service, "[GPU-MAP-DIAG] image={} wrote pitch-linear luma_rows={} fmt={}",
+                      image_id, height, static_cast<u32>(layout.format));
++            // CPU readback only; a match does NOT prove that Vulkan sampled the image.
++            const u64 luma_pos = static_cast<u64>(height / 2) * layout.pitch + width / 2;
++            const bool luma_ok = width != 0 && height != 0 &&
++                                 width <= layout.pitch && luma_pos < bytes.size() &&
++                                 luma_pos < layout.pitch * static_cast<u64>(height);
++            if (luma_ok) {
++                const u8 expected = bytes[static_cast<size_t>(luma_pos)];
++                const u8 actual = memory.Read8(address + luma_pos);
++                LOG_INFO(Service,
++                         "[READBACK-DIAG] image={} plane=Y addr={:#x} expected={} actual={} match={}",
++                         image_id, address + luma_pos, expected, actual, expected == actual);
++            }
++            if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 &&
++                width >= 2 && height >= 2 && layout.pitch >= 2) {
++                const u64 chroma_row = static_cast<u64>(height / 4);
++                const u64 chroma_col = (static_cast<u64>(width / 2) / 2) * 2;
++                const u64 uv_pos = layout.chroma_offset + chroma_row * layout.pitch + chroma_col;
++                const u64 chroma_bytes = layout.pitch * ((static_cast<u64>(height) + 1) / 2);
++                if (chroma_col + 1 < layout.pitch &&
++                    chroma_row < ((static_cast<u64>(height) + 1) / 2) &&
++                    layout.chroma_offset <= layout.size &&
++                    chroma_bytes <= layout.size - layout.chroma_offset &&
++                    uv_pos + 1 < bytes.size()) {
++                    const u8 expected_u = bytes[static_cast<size_t>(uv_pos)];
++                    const u8 expected_v = bytes[static_cast<size_t>(uv_pos + 1)];
++                    const u8 actual_u = memory.Read8(address + uv_pos);
++                    const u8 actual_v = memory.Read8(address + uv_pos + 1);
++                    LOG_INFO(Service,
++                             "[READBACK-DIAG] image={} plane=UV addr={:#x} U={}/{} V={}/{} match={}",
++                             image_id, address + uv_pos, expected_u, actual_u, expected_v,
++                             actual_v, expected_u == actual_u && expected_v == actual_v);
++                }
++            }
+         }
+         return {width, height};
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -2300,3 +2300,14 @@
+ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
+                          std::span<const VideoCommon::BufferImageCopy> copies) {
++    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++        Tegra::Nx2MatchesVideoDiagnosticRange(cpu_addr, gpu_addr,
++                                              VideoCommon::CalculateGuestSizeInBytes(info))) {
++        static std::atomic<u32> traced_uploads{};
++        if (traced_uploads.fetch_add(1, std::memory_order_relaxed) < 32) {
++            LOG_INFO(Render_Vulkan,
++                     "[TEX-BIND-DIAG] upload gpu={:#x} cpu={:#x} {}x{} guest_fmt={} copies={}",
++                     gpu_addr, cpu_addr, info.size.width, info.size.height,
++                     static_cast<u32>(info.format), copies.size());
++        }
++    }
+     // TODO: Move this to another API
+@@ -3050,10 +3061,29 @@
+     if (IsHugeAstcArray(*device, image.info)) {
+         format_info.format = VideoCore::Surface::IsPixelFormatSRGB(format)
+                                  ? VK_FORMAT_A8B8G8R8_SRGB_PACK32
+                                  : VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+     } else if (IsOpaqueBc1Astc(*device, image.info) && IsPixelFormatASTC(format)) {
+         format_info.format = VideoCore::Surface::IsPixelFormatSRGB(format)
+                                  ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+                                  : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+     }
++    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
++        const bool matched = Tegra::Nx2MatchesVideoDiagnosticRange(
++            image.cpu_addr, image.gpu_addr, VideoCommon::CalculateGuestSizeInBytes(image.info));
++        const bool candidate = image.info.size.width >= 1800 &&
++                               image.info.size.height >= 900 &&
++                               image.info.size.width <= 4096 &&
++                               image.info.size.height <= 2160;
++        static std::atomic<u32> traced_candidates{};
++        static std::atomic<u32> traced_matches{};
++        if (matched ? traced_matches.fetch_add(1, std::memory_order_relaxed) < 32
++                    : candidate && traced_candidates.fetch_add(1, std::memory_order_relaxed) < 24) {
++            LOG_INFO(Render_Vulkan,
++                     "[TEX-BIND-DIAG] view-created matched={} gpu={:#x} cpu={:#x} "
++                     "{}x{} guest_fmt={} vk_fmt={} render_target={}",
++                     matched, image.gpu_addr, image.cpu_addr, image.info.size.width,
++                     image.info.size.height, static_cast<u32>(format),
++                     static_cast<u32>(format_info.format), info.IsRenderTarget());
++        }
++    }
+     if (device->ApiVersion() >= VK_API_VERSION_1_3) {
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -412,2 +412,11 @@
+         LOG_ERROR(HW_GPU, "Native QMD failed: {}", error);
++        if (memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
++            const u64 cbuf0 = (u64{qmd[33] & 0xff} << 32) | qmd[32];
++            LOG_ERROR(HW_GPU,
++                      "[COMPUTE-DIAG] qmd={:#x} shader={:#x} "
++                      "grid={}x{}x{} block={}x{}x{} shared={} cbuf_mask={:#x} cbuf0={:#x}",
++                      qmd_address, program, qmd[12], qmd[13] & 0xffff,
++                      qmd[14] & 0xffff, qmd[18] >> 16, qmd[19] & 0xffff,
++                      qmd[19] >> 16, qmd[17] & 0x3ffff, qmd[20] & 0xff, cbuf0);
++        }
+         if (qmd_diagnostics && memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
