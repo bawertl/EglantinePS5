@@ -1,0 +1,158 @@
+diff --git a/src/video_core/host1x/nx2_video_decoder.cpp b/src/video_core/host1x/nx2_video_decoder.cpp
+--- a/src/video_core/host1x/nx2_video_decoder.cpp
++++ b/src/video_core/host1x/nx2_video_decoder.cpp
+@@ -1,4 +1,5 @@
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstring>
+ #include <optional>
+@@ -29,4 +30,9 @@
+     u64 decoded_frames{};
+     u64 submitted_packets{};
++    u64 timing_samples{};
++    u64 timing_send_total_us{};
++    u64 timing_receive_total_us{};
++    u64 timing_send_max_us{};
++    u64 timing_receive_max_us{};
+ 
+     ~Impl() {
+@@ -56,4 +62,11 @@
+              static_cast<u64>(parsed->codec), parsed->extradata.size(),
+              impl->open ? "open" : "failed to open");
++    if (impl->open) {
++        const auto* codec = impl->context->GetCodecContext();
++        LOG_INFO(HW_GPU, "[VDEC-TIME-DIAG] opened codec={} ffmpeg_threads={} "
++                         "thread_type={:#x} active_thread_type={:#x}",
++                 codec->codec && codec->codec->name ? codec->codec->name : "unknown",
++                 codec->thread_count, codec->thread_type, codec->active_thread_type);
++    }
+ }
+ 
+@@ -80,6 +93,30 @@
+     }
+     impl->pending_pts.insert(pts);
++    const auto before_send = std::chrono::steady_clock::now();
+     impl->context->SendPacket(packet);
++    const auto after_send = std::chrono::steady_clock::now();
+     impl->Receive(pictures);
++    const auto after_receive = std::chrono::steady_clock::now();
++    const auto elapsed_us = [](auto start, auto end) -> u64 {
++        return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
++            end - start).count());
++    };
++    const u64 send_us = elapsed_us(before_send, after_send);
++    const u64 receive_us = elapsed_us(after_send, after_receive);
++    ++impl->timing_samples;
++    impl->timing_send_total_us += send_us;
++    impl->timing_receive_total_us += receive_us;
++    impl->timing_send_max_us = std::max(impl->timing_send_max_us, send_us);
++    impl->timing_receive_max_us = std::max(impl->timing_receive_max_us, receive_us);
++    if (impl->submitted_packets <= 3 || (impl->submitted_packets % 120) == 0) {
++        LOG_INFO(HW_GPU, "[VDEC-TIME-DIAG] packet={} pts={} send_us={} receive_us={} "
++                         "avg_send_us={} avg_receive_us={} max_send_us={} max_receive_us={} "
++                         "decoded_total={}",
++                 impl->submitted_packets, pts, send_us, receive_us,
++                 impl->timing_send_total_us / impl->timing_samples,
++                 impl->timing_receive_total_us / impl->timing_samples,
++                 impl->timing_send_max_us, impl->timing_receive_max_us,
++                 impl->decoded_frames);
++    }
+ }
+ 
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -27,4 +27,7 @@
+         m_cv.notify_one();
+         const u64 id = ++m_submitted;
++        if (end) {
++            LOG_INFO(Service, "[VDEC-EOF-DIAG] submit end=true packet={} pts_us={}", id, pts);
++        }
+         TipcReplyWords(ctx, {static_cast<u32>(id), static_cast<u32>(id >> 32)});
+     }
+@@ -52,4 +55,8 @@
+         {
+             std::scoped_lock lk{m_mutex};
++            LOG_INFO(Service, "[VDEC-EOF-DIAG] command={} pre_clear_inputs={} "
++                              "decoded={} outputs={} free_images={} stream_ended={}",
++                     ctx.GetCommand(), m_inputs.size(), m_decoded.size(), m_outputs.size(),
++                     m_free.size(), m_stream_ended);
+             m_inputs.clear();
+             m_flush = true;
+@@ -80,4 +87,8 @@
+             return;
+         }
++        if (output->end) {
++            LOG_INFO(Service, "[VDEC-EOF-DIAG] delivered end=true image={} pts_us={}",
++                     output->image, output->pts);
++        }
+         const u64 pts_ns = output->pts * 1000;
+         TipcReplyWords(ctx, {output->image, output->width, output->height, output->width,
+@@ -104,10 +115,18 @@
+         std::vector<u8> bytes;
+         std::vector<u8> tiled_bytes;
++        u64 input_batches{};
+         std::unique_lock lk{m_mutex};
+         while (true) {
++            const auto before_wait = std::chrono::steady_clock::now();
+             m_cv.wait(lk, [&] {
+                 return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
+                        (!m_inputs.empty() && m_decoded.size() < MaxDecodedAhead);
+             });
++            const auto after_wait = std::chrono::steady_clock::now();
++            const auto elapsed_us = [](auto start, auto end) -> u64 {
++                return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
++                    end - start).count());
++            };
++            const u64 condition_wait_us = elapsed_us(before_wait, after_wait);
+             if (m_quit) {
+                 return;
+@@ -133,9 +152,14 @@
+                 }
+                 lk.unlock();
++                const auto before_release = std::chrono::steady_clock::now();
+                 if (fence) {
+                     WaitForRelease(*fence);
+                 }
++                const auto before_write = std::chrono::steady_clock::now();
+                 const auto [width, height] =
+                     WriteImage(decoder.get(), image, frame, bytes, tiled_bytes);
++                const auto after_write = std::chrono::steady_clock::now();
++                const u64 release_wait_us = elapsed_us(before_release, before_write);
++                const u64 write_us = elapsed_us(before_write, after_write);
+                 lk.lock();
+                 // Even an image written during a flush counts: the client waits for its value.
+@@ -146,4 +170,12 @@
+                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                 ++m_frames_out;
++                if (m_frames_out <= 3 || (m_frames_out % 120) == 0 || frame.end) {
++                    LOG_INFO(Service, "[VDEC-PIPE-DIAG] output={} pts_us={} cond_wait_us={} "
++                                      "release_wait_us={} write_us={} input_q={} decoded_q={} "
++                                      "free_images={} output_q={} end={}",
++                             m_frames_out, frame.pts, condition_wait_us, release_wait_us,
++                             write_us, m_inputs.size(), m_decoded.size(), m_free.size(),
++                             m_outputs.size(), frame.end);
++                }
+                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
+                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
+@@ -172,8 +204,11 @@
+             }
+             pictures.clear();
++            const auto before_decode = std::chrono::steady_clock::now();
+             decoder->Decode(input.data, input.pts, pictures);
+             if (input.end) {
+                 decoder->Drain(pictures);
+             }
++            const auto after_decode = std::chrono::steady_clock::now();
++            const u64 decode_us = elapsed_us(before_decode, after_decode);
+             lk.lock();
+             if (m_flush) {
+@@ -200,4 +235,7 @@
+                     m_decoded.back().end = true;
+                 }
++                LOG_INFO(Service, "[VDEC-EOF-DIAG] drained pts_us={} decoded_queue={} "
++                                  "input_queue={} free_images={}",
++                         input.pts, m_decoded.size(), m_inputs.size(), m_free.size());
+             }
+         }
