@@ -1,0 +1,126 @@
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -106,4 +106,13 @@
+     TipcReplyWords(ctx, std::span<const u32>{words.begin(), words.size()});
+ }
+ 
++// Switch 2 TIPC placeholder with fully initialized output words, as in the
++// 2026-11-07 PC core. The older auto-stub returned only a success result,
++// leaving SDK output data unchanged (potentially invalid enums and handles).
++// Use only for explicit compatibility handlers, not all existing HLE services.
++inline void TipcReplyZeroed(HLERequestContext& ctx) {
++    constexpr std::array<u32, 32> zeros{};
++    TipcReplyWords(ctx, std::span<const u32>{zeros});
++}
++
+ // Replies with success and a copied handle to a new session served by `iface`.
+@@ -1066,4 +1075,8 @@
+             {21, &INx2Vi2Session::GetNotifications, "GetNotifications"},
+             {31, &INx2Vi2Session::GetVsyncEvent, "GetVsyncEvent (guessed)"},
+             {32, &INx2Vi2Session::GetVsyncEvent, "GetDisplayVsyncEvent (guessed)"},
++            // The original core already signals the 31/32 events every vblank;
++            // 261 only acknowledges binding in this version's event model.
++            {261, &INx2Vi2Session::BindVsyncCompat, "BindDisplayVsyncEvent"},
++            {301, &INx2Vi2Session::ReplyZeroedCompat, "Unknown301"},
+             // Title 1 calls these ~75 times a second with the display name "default"; the
+@@ -1106,3 +1119,16 @@
+ private:
++    void BindVsyncCompat(HLERequestContext& ctx) {
++        // In the legacy PS5 core GetVsyncEvent(31/32) already schedules vblank
++        // signalling. Do not add a second timer or duplicate event ownership.
++        LOG_INFO(Service, "nx2:vi2 TIPC 261 binding existing vsync event slot {}",
++                 ctx.CommandBuffer()[4]);
++        TipcReplyWords(ctx, {});
++    }
++
++    void ReplyZeroedCompat(HLERequestContext& ctx) {
++        LOG_DEBUG(Service, "nx2:vi2 TIPC {} zeroed compatibility reply", ctx.GetCommand());
++        TipcReplyZeroed(ctx);
++    }
++
+     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
+     // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
+@@ -2115,5 +2141,6 @@
+         RegisterHandlersTipc({
+             {4, &INx2GraphicsSystemSession::Stub, "Boot (Switch 2, guessed)"},
+             {5, &INx2GraphicsSystemSession::Stub, "Unknown5"},
++            {11, &INx2GraphicsSystemSession::RegisterClientHandle, "RegisterClientHandle"},
+             {101, &INx2GraphicsSystemSession::Stub, "Unknown101"},
+             {202, &INx2GraphicsSystemSession::OpenSyncptSession, "OpenSyncptSession (guessed)"},
+@@ -2152,4 +2179,18 @@
+              "CalculateChatImagePoolSize (guessed)"},
+             {911, &INx2GraphicsSystemSession::CreateDecoderImage, "CreateDecoderImage"},
+             {961, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetCpuUserImageDescriptor"},
++            // Switch 2 compositor and GPU-session negotiation: selective
++            // backport from Djihads80/Eglantine daily-20261107 (216d3e2).
++            // Keep the original 115 mapping (ConfigureNativeMemory) unchanged.
++            {126, &INx2GraphicsSystemSession::GetSessionFlag, "GetSessionFlag"},
++            {201, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission201"},
++            {301, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission301"},
++            {401, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission401"},
++            {402, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission402"},
++            {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
++            {1101, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1101"},
++            {1102, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1102"},
++            {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetFeatureVersion"},
++            {1501, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1501"},
++            {1502, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1502"},
+         });
+@@ -2170,3 +2211,41 @@
+ private:
++    // Corresponds to the Windows Eglantine RegisterClientHandle implementation:
++    // this is a per-session registration flag, not a fabricated GPU state machine.
++    void RegisterClientHandle(HLERequestContext& ctx) {
++        if (m_client_handle_registered) {
++            LOG_WARNING(Service, "nx2:gsv TIPC 11 called twice");
++            IPC::ResponseBuilder rb{ctx, 2};
++            rb.Push(ResultUnknown);
++            return;
++        }
++        m_client_handle_registered = true;
++        LOG_INFO(Service, "nx2:gsv TIPC 11 client registered");
++        TipcReplyWords(ctx, {});
++    }
++
++    void CheckPermission(HLERequestContext& ctx) {
++        LOG_DEBUG(Service, "nx2:gsv TIPC {} permission check", ctx.GetCommand());
++        TipcReplyWords(ctx, {});
++    }
++
++    void GetSessionFlag(HLERequestContext& ctx) {
++        TipcReplyWords(ctx, {0});
++    }
++
++    void AttachGpuAddressSpace(HLERequestContext& ctx) {
++        const u32 id = ctx.CommandBuffer()[2];
++        m_address_spaces.insert(id);
++        LOG_INFO(Service, "nx2:gsv TIPC 434 GPU address space {} attached", id);
++        TipcReplyWords(ctx, {});
++    }
++
++    void SetFeatureVersion(HLERequestContext& ctx) {
++        LOG_INFO(Service, "nx2:gsv TIPC 1111 feature version {:#x}", ctx.CommandBuffer()[2]);
++        TipcReplyWords(ctx, {});
++    }
++
++    std::set<u32> m_address_spaces;
++    bool m_client_handle_registered = false;
++
+     // Index of the first raw data word of a TIPC request: header (2 words), then an optional
+     // special header with pid and copy/move handle words.
+diff --git a/src/core/hle/service/am/service/graphics_scale_controller.h b/src/core/hle/service/am/service/graphics_scale_controller.h
+--- a/src/core/hle/service/am/service/graphics_scale_controller.h
++++ b/src/core/hle/service/am/service/graphics_scale_controller.h
+@@ -28,6 +28,10 @@
+ private:
+-    Result GetCurrentGraphicsScale(Out<u32> out_scale) {
++    // Windows core writes the whole 12-byte result, not just the scale enum.
++    Result GetCurrentGraphicsScale(Out<u32> out_scale, Out<u32> out_unknown1,
++                                   Out<u32> out_unknown2) {
+         LOG_WARNING(Service_AM, "(STUBBED) called, returning 10");
+         *out_scale = 10;
++        *out_unknown1 = 0;
++        *out_unknown2 = 0;
+         R_SUCCEED();
+     }
