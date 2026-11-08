@@ -1,0 +1,79 @@
+--- a/src/core/hle/service/hle_ipc.cpp
++++ b/src/core/hle/service/hle_ipc.cpp
+@@ -69,6 +69,19 @@
+             result = this->SessionHandler().HandleSyncRequest(*server_session, context);
+         }
+     } else {
++        // Diagnostic only: preserve existing assert and response behavior.
++        const auto manager = context.GetManager();
++        const bool has_domain_header = context.HasDomainMessageHeader();
++        const u32 object_id = has_domain_header ? context.GetDomainMessageHeader().object_id : 0;
++        const auto* const raw = context.CommandBuffer();
++        LOG_CRITICAL(IPC,
++                     "[IPC-DIAG-FAIL] session={} guest_thread={} manager={} is_domain={} "
++                     "has_domain_header={} object_id={:#010x} "
++                     "raw0={:#010x} raw1={:#010x} raw2={:#010x} raw3={:#010x} "
++                     "raw4={:#010x} raw5={:#010x} raw6={:#010x} raw7={:#010x}",
++                     fmt::ptr(server_session), fmt::ptr(&context.GetThread()),
++                     fmt::ptr(manager.get()), IsDomain(), has_domain_header, object_id,
++                     raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+         ASSERT_MSG(false, "Session handler is invalid, stubbing response!");
+         IPC::ResponseBuilder rb(context, 2);
+         rb.Push(ResultSuccess);
+@@ -197,7 +210,32 @@
+             // If this is an incoming message, only CommandType "Request" has a domain header
+             // All outgoing domain messages have the domain header, if only incoming has it
+             if (incoming || domain_message_header) {
++                const u32 domain_header_word_offset = rp.GetCurrentOffset();
+                 domain_message_header = rp.PopRaw<IPC::DomainMessageHeader>();
++                if (incoming && domain_message_header->object_id == 0x49434653U) {
++                    // Inspect the incoming TLS buffer before any response overwrites it.
++                    const auto manager = GetManager();
++                    LOG_CRITICAL(IPC,
++                                 "[IPC-DIAG-PARSE] SFCI as domain object: session={} "
++                                 "guest_thread={} manager={} domain={} tipc={} "
++                                 "domain_header_word_offset={} domain_cmd={} in_objects={} "
++                                 "length={} object_id={:#010x} "
++                                 "raw0={:#010x} raw1={:#010x} raw2={:#010x} raw3={:#010x} "
++                                 "raw4={:#010x} raw5={:#010x} raw6={:#010x} raw7={:#010x} "
++                                 "raw8={:#010x} raw9={:#010x} raw10={:#010x} raw11={:#010x}",
++                                 fmt::ptr(Session()), fmt::ptr(&GetThread()),
++                                 fmt::ptr(manager.get()), manager && manager->IsDomain(),
++                                 command_header->IsTipc(), domain_header_word_offset,
++                                 static_cast<u32>(domain_message_header->command),
++                                 domain_message_header->input_object_count,
++                                 domain_message_header->length, domain_message_header->object_id,
++                                 static_cast<u32>(src_cmdbuf[0]), static_cast<u32>(src_cmdbuf[1]),
++                                 static_cast<u32>(src_cmdbuf[2]), static_cast<u32>(src_cmdbuf[3]),
++                                 static_cast<u32>(src_cmdbuf[4]), static_cast<u32>(src_cmdbuf[5]),
++                                 static_cast<u32>(src_cmdbuf[6]), static_cast<u32>(src_cmdbuf[7]),
++                                 static_cast<u32>(src_cmdbuf[8]), static_cast<u32>(src_cmdbuf[9]),
++                                 static_cast<u32>(src_cmdbuf[10]), static_cast<u32>(src_cmdbuf[11]));
++                }
+             } else {
+                 if (GetManager()->IsDomain()) {
+                     LOG_WARNING(IPC, "Domain request has no DomainMessageHeader!");
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -76,6 +76,21 @@
+     const bool auto_stub = Settings::values.use_auto_stub || env_auto_stub ||
+                            std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
+                            (caller != nullptr && caller->IsSwitch2());
++    if (std::string_view{service_name} == "prepo:u" && ctx.GetCommand() == 10500) {
++        // Diagnostic only. Place before the repeated-command early return.
++        const auto manager = ctx.GetManager();
++        const bool has_domain_header = ctx.HasDomainMessageHeader();
++        const auto* const raw = ctx.CommandBuffer();
++        LOG_CRITICAL(Service,
++                     "[IPC-DIAG-STUB] service={} cmd={} session={} guest_thread={} "
++                     "manager={} domain={} has_domain_header={} domain_obj={:#010x} "
++                     "auto_stub={} raw0={:#010x} raw1={:#010x} raw2={:#010x}",
++                     service_name, ctx.GetCommand(), fmt::ptr(ctx.Session()),
++                     fmt::ptr(&ctx.GetThread()), fmt::ptr(manager.get()),
++                     manager && manager->IsDomain(), has_domain_header,
++                     has_domain_header ? ctx.GetDomainMessageHeader().object_id : 0U,
++                     auto_stub, raw[0], raw[1], raw[2]);
++    }
+     // Auto-stubbed commands are reported once each: title 1 polls nx2:camera 29 every frame
+     // (~47 calls a second), and every report wrote a Critical line, which flushes the log file.
+     if (auto_stub) {
