@@ -1,0 +1,78 @@
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -6,3 +6,4 @@
++#include <cstdlib>
+ #include <cstring>
+ #include <string_view>
+ #include <vector>
+@@ -302,11 +303,18 @@
+ bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> extradata) {
+-    // The PS5 sandbox cannot reliably auto-detect CPU count; libdav1d falls back to one
+-    // worker when thread_count is zero. Limit this trial to AV1/libdav1d only.
++    // PS5 AV1-only controlled trial. Keep 4 threads as the exact V1.000.017 A/B baseline:
++    // EDEN_AV1_THREADS=4 in env.txt; the V1.000.018 default is 6.
+     if (const AVCodec* codec = decoder.GetCodec();
+         codec != nullptr && codec->id == AV_CODEC_ID_AV1 && codec->name != nullptr &&
+         std::string_view{codec->name} == "libdav1d") {
+-        m_codec_context->thread_count = 4;
+-        LOG_INFO(HW_GPU, "[AV1-THREADS] libdav1d requested_threads={}",
++        int threads = 6;
++        if (const char* override_value = std::getenv("EDEN_AV1_THREADS");
++            override_value != nullptr && override_value[0] >= '1' &&
++            override_value[0] <= '8' && override_value[1] == '\0') {
++            threads = override_value[0] - '0';
++        }
++        m_codec_context->thread_count = threads;
++        LOG_INFO(HW_GPU, "[AV1-THREADS] libdav1d requested_threads={} "
++                         "(default=6, EDEN_AV1_THREADS=1..8 overrides)",
+                  m_codec_context->thread_count);
+     }
+     if (!extradata.empty()) {
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -2217,5 +2217,33 @@
+             LOG_INFO(Service, "[VDEC-EOF-DIAG] delivered end=true image={} pts_us={}",
+                      output->image, output->pts);
+         }
++        // Count distinct PTS values *acquired by the guest movie player*. This is NOT the
++        // number of visually distinct video frames actually scanned out to the TV; whole
++        // scene presents can repeat the same decoded movie image.
++        const auto acquired_at = std::chrono::steady_clock::now();
++        if (m_client_outputs == 0) {
++            m_client_window_at = acquired_at;
++        }
++        ++m_client_outputs;
++        if (m_client_outputs == 1 || output->pts != m_client_last_pts) {
++            ++m_client_unique_pts;
++        }
++        m_client_last_pts = output->pts;
++        if (m_client_outputs <= 3 || (m_client_outputs % 120) == 0 || output->end) {
++            const auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                acquired_at - m_client_window_at).count();
++            const u64 delta = m_client_outputs - m_client_window_count;
++            const u64 rate_x100 = window_ms > 0
++                ? (delta * 100000ULL) / static_cast<u64>(window_ms) : 0;
++            LOG_INFO(Service, "[VDEC-CLIENT-DIAG] acquired={} unique_pts={} image={} "
++                              "pts_us={} acquire_fps_x100={} window_ms={} end={} "
++                              "(NOT display FPS)",
++                     m_client_outputs, m_client_unique_pts, output->image, output->pts,
++                     rate_x100, window_ms, output->end);
++            if ((m_client_outputs % 120) == 0) {
++                m_client_window_at = acquired_at;
++                m_client_window_count = m_client_outputs;
++            }
++        }
+         const u64 pts_ns = output->pts * 1000;
+         TipcReplyWords(ctx, {output->image, output->width, output->height, output->width,
+@@ -2477,3 +2505,9 @@
+     u64 m_frames_out{};
++    // Decoder output -> guest movie-player acquisition diagnostic (NOT scanout FPS).
++    u64 m_client_outputs{};
++    u64 m_client_unique_pts{};
++    u64 m_client_last_pts{};
++    u64 m_client_window_count{};
++    std::chrono::steady_clock::time_point m_client_window_at{};
+     std::deque<Input> m_inputs;
+     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
