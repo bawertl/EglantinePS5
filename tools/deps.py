@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pathlib
+import urllib.parse
 import shutil
 import subprocess
 import sys
@@ -70,31 +71,74 @@ def pinned_hash(entry):
     fail(f'no pinned hash for {entry.get("url")}')
 
 
+def github_release_asset_api(url):
+    """Return a fresh API asset endpoint for a GitHub release link, when available.
+
+    GitHub's browser-download redirect can be cached with an expired signed URL.
+    The release API gives us a second, independently resolved route to the SAME
+    release asset; the pinned file digest remains mandatory on either route.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    parts = parsed.path.strip('/').split('/')
+    if parsed.netloc != 'github.com' or len(parts) < 6 or parts[2:4] != ['releases', 'download']:
+        return None
+    owner, repo, tag, filename = parts[0], parts[1], parts[4], '/'.join(parts[5:])
+    api = (f'https://api.github.com/repos/{owner}/{repo}/releases/tags/'
+           f'{urllib.parse.quote(tag, safe="")}')
+    headers = {'User-Agent': 'eglantineps5-deps', 'Accept': 'application/vnd.github+json'}
+    # Do not print tokens or URLs containing secrets. The API works anonymously for public releases.
+    request = urllib.request.Request(api, headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        release = json.load(response)
+    for asset in release.get('assets', []):
+        if asset.get('name') == filename:
+            return asset['url']
+    return None
+
+
 def download(url, algorithm, expected, name):
-    """The cached, verified download of url (downloaded when missing or corrupt)."""
+    """Download pinned bytes with retries, cached checksum and GitHub release API fallback."""
     CACHE.mkdir(parents=True, exist_ok=True)
     target = CACHE / name
     if target.exists() and digest(target, algorithm) == expected:
         return target
     partial = target.with_name(target.name + f'.partial-{os.getpid()}')
+    api_url = None
+    last_error = None
     for attempt in range(1, 4):
-        try:
-            print(f'deps: downloading {url}', flush=True)
-            request = urllib.request.Request(url, headers={'User-Agent': 'eglantineps5-deps'})
-            with urllib.request.urlopen(request, timeout=120) as response, open(partial, 'wb') as out:
-                shutil.copyfileobj(response, out, 1 << 20)
-            break
-        except OSError as error:
-            partial.unlink(missing_ok=True)
-            if attempt == 3:
-                fail(f'cannot download {url}: {error}')
+        # Alternate the direct release URL with the GitHub API, which resolves a fresh
+        # signed asset redirect. A cache-busting query handles stale CDN redirects.
+        urls = [(url, {'User-Agent': 'eglantineps5-deps'})]
+        if '/releases/download/' in url and url.startswith('https://github.com/'):
+            try:
+                if api_url is None:
+                    api_url = github_release_asset_api(url)
+                if api_url:
+                    urls.append((api_url, {'User-Agent': 'eglantineps5-deps',
+                                           'Accept': 'application/octet-stream'}))
+            except (OSError, ValueError, KeyError) as error:
+                last_error = error
+            join = '&' if urllib.parse.urlsplit(url).query else '?'
+            urls.append((f'{url}{join}attempt={attempt}-{os.getpid()}',
+                         {'User-Agent': 'eglantineps5-deps'}))
+        for source, headers in urls:
+            try:
+                print(f'deps: downloading {source}', flush=True)
+                request = urllib.request.Request(source, headers=headers)
+                with urllib.request.urlopen(request, timeout=120) as response, open(partial, 'wb') as out:
+                    shutil.copyfileobj(response, out, 1 << 20)
+                actual = digest(partial, algorithm)
+                if actual == expected:
+                    partial.replace(target)
+                    return target
+                last_error = f'{algorithm} mismatch: got {actual}, expected {expected}'
+            except OSError as error:
+                last_error = error
+            finally:
+                partial.unlink(missing_ok=True)
+        if attempt != 3:
             time.sleep(5 * attempt)
-    actual = digest(partial, algorithm)
-    if actual != expected:
-        partial.unlink(missing_ok=True)
-        fail(f'{url}: {algorithm} {actual} does not match the pinned {expected}')
-    partial.replace(target)
-    return target
+    fail(f'cannot download or verify {url}: {last_error}')
 
 
 def extract(archive, destination, strip, only=()):
@@ -170,8 +214,29 @@ def fetch_git(item):
             fail(f'{item["name"]}: fetched {head}, pinned {item["commit"]}')
         staging.rename(path)
     if 'setup' in item and not (path / item['setup_creates']).exists():
-        print(f'deps: setting up {item["name"]}: {" ".join(item["setup"])}', flush=True)
-        subprocess.run(item['setup'], cwd=path, check=True)
+        command = item['setup']
+        if item['name'] == 'boilerplate':
+            # The boilerplate's setup-native-dependencies.sh uses one silent wget to
+            # fetch the very same SDK that lapy-payload-sdk already pins by SHA-256.
+            # Fetch it once via our verified, retrying cache and reuse its SDK tree;
+            # still run upstream's setup for native zlib (with --skip-sdk).
+            sdk_item = next(entry for entry in MANIFEST['items']
+                            if entry['name'] == 'lapy-payload-sdk')
+            fetch(sdk_item)
+            sdk_source = ROOT / sdk_item['extract']
+            if not ((sdk_source / 'bin/prospero-clang').is_file() and
+                    (sdk_source / 'bin/prospero-lld').is_file() and
+                    (sdk_source / 'target/include').is_dir()):
+                fail('pinned payload SDK is incomplete; refusing boilerplate setup')
+            sdk_link = path / '.deps/native/ps5-payload-sdk'
+            sdk_link.parent.mkdir(parents=True, exist_ok=True)
+            if not sdk_link.exists() and not sdk_link.is_symlink():
+                sdk_link.symlink_to(sdk_source.resolve(), target_is_directory=True)
+            elif not sdk_link.resolve().samefile(sdk_source.resolve()):
+                fail(f'{sdk_link} is not the pinned SDK; not replacing existing data')
+            command = [*command, '--skip-sdk']
+        print(f'deps: setting up {item["name"]}: {" ".join(command)}', flush=True)
+        subprocess.run(command, cwd=path, check=True)
 
 
 def fetch(item):
