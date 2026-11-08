@@ -22,6 +22,15 @@
       "creates": ".deps/fmt-12.1.0/include/fmt/format.h"
     },
     {
+      "name": "catch2",
+      "about": "Catch2 host-only NX2 regression tests; pinned commit fetched before build to avoid intermittent CMake archive-download failures",
+      "kind": "git",
+      "url": "https://github.com/catchorg/Catch2.git",
+      "version": "v3.13.0",
+      "commit": "29c9844f688acb27c87338c39cd186ebfe41aa19",
+      "path": ".deps/catch2-v3.13.0"
+    },
+    {
       "name": "compiler-rt",
       "about": "LLVM 18.1.8 emulated-TLS runtime (emutls.c and its headers) for the PS5 build",
       "kind": "files",
