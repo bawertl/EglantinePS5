@@ -24,7 +24,7 @@ diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shad
 diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
 --- a/src/video_core/host1x/ffmpeg.cpp
 +++ b/src/video_core/host1x/ffmpeg.cpp
-@@ -1,4 +1,13 @@
+@@ -302,4 +302,13 @@
  bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> extradata) {
 +    // The PS5 sandbox cannot reliably auto-detect CPU count; libdav1d falls back to one
 +    // worker when thread_count is zero. Limit this trial to AV1/libdav1d only.
