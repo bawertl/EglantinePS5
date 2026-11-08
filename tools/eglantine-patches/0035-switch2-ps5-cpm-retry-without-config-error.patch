@@ -1,0 +1,82 @@
+diff --git a/CMakeModules/CPMUtil.cmake b/CMakeModules/CPMUtil.cmake
+--- a/CMakeModules/CPMUtil.cmake
++++ b/CMakeModules/CPMUtil.cmake
+@@ -181,27 +181,63 @@
+     list(LENGTH ARGN argn_len)
+     if(argn_len GREATER 0)
+         list(GET ARGN 0 hash)
+-        set(args EXPECTED_HASH SHA512=${hash})
+     else()
+-        unset(args)
++        set(hash "")
+     endif()
+ 
+-    foreach(i RANGE 5)
+-        file(DOWNLOAD ${url} ${file}
+-            ${args}
+-            STATUS ret)
++    # file(DOWNLOAD EXPECTED_HASH) records a CMake configuration error on the first
++    # HTTP failure, even if the next retry succeeds. Fetch externally so a
++    # transient response cannot poison an otherwise successful configure.
++    find_program(CPMUTIL_CURL_EXECUTABLE NAMES curl)
++    if(NOT CPMUTIL_CURL_EXECUTABLE)
++        fatal("CPMUtil requires curl for verified dependency downloads")
++    endif()
+ 
+-        list(GET ret 0 code)
+-        if (code EQUAL 0)
++    set(download_urls "${url}")
++    # Github archive URLs redirect to codeload. Try it directly on failure.
++    if(url MATCHES "^https://github\.com/([^/]+)/([^/]+)/archive/(.+)\.tar\.gz$")
++        list(APPEND download_urls
++            "https://codeload.github.com/${CMAKE_MATCH_1}/${CMAKE_MATCH_2}/tar.gz/${CMAKE_MATCH_3}")
++    endif()
++
++    get_filename_component(download_dir "${file}" DIRECTORY)
++    file(MAKE_DIRECTORY "${download_dir}")
++    set(partial "${file}.part")
++    set(download_ok FALSE)
++    foreach(attempt RANGE 1 5)
++        foreach(download_url IN LISTS download_urls)
++            file(REMOVE "${partial}")
++            execute_process(
++                COMMAND "${CPMUTIL_CURL_EXECUTABLE}" --fail --location --silent --show-error
++                    --connect-timeout 15 --max-time 90 --output "${partial}" "${download_url}"
++                RESULT_VARIABLE download_result ERROR_VARIABLE download_error)
++            if(NOT "${download_result}" STREQUAL "0")
++                echo_error("CPM download attempt ${attempt} failed for ${download_url}: ${download_error}")
++                continue()
++            endif()
++            if(NOT "${hash}" STREQUAL "")
++                file(SHA512 "${partial}" actual_hash)
++                if(NOT "${actual_hash}" STREQUAL "${hash}")
++                    echo_error("CPM checksum mismatch for ${download_url}; refusing the archive")
++                    continue()
++                endif()
++            endif()
++            file(RENAME "${partial}" "${file}" RESULT rename_result)
++            if(NOT "${rename_result}" STREQUAL "0")
++                fatal("Cannot store verified CPM download at ${file}: ${rename_result}")
++            endif()
++            set(download_ok TRUE)
++            break()
++        endforeach()
++        if(download_ok)
+             break()
+         endif()
+-
+-        echo_error("Download failed. Trying again in 5 seconds")
+-        sleep(5)
++        if(attempt LESS 5)
++            sleep(5)
++        endif()
+     endforeach()
+-
+-    # TODO: use return code or something
+-    if (NOT code EQUAL 0)
+-        fatal("Download for ${pkg_url} failed after 5 tries")
++    file(REMOVE "${partial}")
++    if(NOT download_ok)
++        fatal("Download for ${url} failed after 5 attempts (including archive mirror)")
+     endif()
+ endfunction()
