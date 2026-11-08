@@ -1,12 +1,12 @@
 diff --git a/src/video_core/host1x/nx2_video_decoder.cpp b/src/video_core/host1x/nx2_video_decoder.cpp
 --- a/src/video_core/host1x/nx2_video_decoder.cpp
 +++ b/src/video_core/host1x/nx2_video_decoder.cpp
-@@ -1,4 +1,5 @@
- #include <algorithm>
- #include <array>
+@@ -10,4 +10,5 @@
+ #include "common/settings.h"
+ #include "video_core/host1x/ffmpeg.h"
+ #include "video_core/host1x/nx2_video_decoder.h"
 +#include <chrono>
- #include <cstring>
- #include <optional>
+ 
 @@ -29,4 +30,9 @@
      u64 decoded_frames{};
      u64 submitted_packets{};
@@ -89,10 +89,9 @@ diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
 +        }
          const u64 pts_ns = output->pts * 1000;
          TipcReplyWords(ctx, {output->image, output->width, output->height, output->width,
-@@ -104,10 +115,18 @@
+@@ -104,10 +115,17 @@
          std::vector<u8> bytes;
          std::vector<u8> tiled_bytes;
-+        u64 input_batches{};
          std::unique_lock lk{m_mutex};
          while (true) {
 +            const auto before_wait = std::chrono::steady_clock::now();
@@ -136,18 +135,6 @@ diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
 +                }
                  if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
                      LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
-@@ -172,8 +204,11 @@
-             }
-             pictures.clear();
-+            const auto before_decode = std::chrono::steady_clock::now();
-             decoder->Decode(input.data, input.pts, pictures);
-             if (input.end) {
-                 decoder->Drain(pictures);
-             }
-+            const auto after_decode = std::chrono::steady_clock::now();
-+            const u64 decode_us = elapsed_us(before_decode, after_decode);
-             lk.lock();
-             if (m_flush) {
 @@ -200,4 +235,7 @@
                      m_decoded.back().end = true;
                  }
