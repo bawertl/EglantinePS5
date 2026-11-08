@@ -199,6 +199,41 @@ def git(*args, cwd=None):
     subprocess.run(['git', *args], cwd=cwd, check=True)
 
 
+def boilerplate_zlib_ready(path):
+    """The SDK marker alone does not prove upstream's zlib setup finished."""
+    root = path / '.deps/native/zlib/root'
+    return (root / '.source-version').is_file() and \
+           (root / '.source-version').read_text().strip() == '1.3.2' and \
+           (root / 'usr/include/zlib.h').is_file() and \
+           any(root.rglob('libz.a'))
+
+
+def stage_boilerplate_zlib(path):
+    """Seed upstream's zlib archive from the identical, SHA-verified official release.
+
+    The legacy zlib.net/fossils URL can return an HTML/error body. Upstream's
+    setup script then exits with a checksum mismatch. We NEVER relax its digest
+    check: copy only bytes matching the publisher's pinned 1.3.2 SHA-256.
+    """
+    expected = 'bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16'
+    archive = path / '.deps/native/zlib/zlib-1.3.2.tar.gz'
+    if archive.is_file() and digest(archive, 'sha256') == expected:
+        print('deps: verified cached boilerplate zlib 1.3.2', flush=True)
+        return
+    verified = download('https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz',
+                        'sha256', expected, 'boilerplate-zlib-1.3.2.tar.gz')
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    temp = archive.with_name(archive.name + f'.partial-{os.getpid()}')
+    try:
+        shutil.copyfile(verified, temp)
+        if digest(temp, 'sha256') != expected:
+            fail('boilerplate zlib: verified staging copy does not match SHA-256')
+        temp.replace(archive)
+    finally:
+        temp.unlink(missing_ok=True)
+    print('deps: seeded official, SHA-256-verified boilerplate zlib 1.3.2', flush=True)
+
+
 def fetch_git(item):
     path = location(item)
     if not path.exists():
@@ -213,7 +248,10 @@ def fetch_git(item):
         if head != item['commit']:
             fail(f'{item["name"]}: fetched {head}, pinned {item["commit"]}')
         staging.rename(path)
-    if 'setup' in item and not (path / item['setup_creates']).exists():
+    needs_setup = ('setup' in item and
+                   (not (path / item['setup_creates']).exists() or
+                    (item['name'] == 'boilerplate' and not boilerplate_zlib_ready(path))))
+    if needs_setup:
         command = item['setup']
         if item['name'] == 'boilerplate':
             # The boilerplate's setup-native-dependencies.sh uses one silent wget to
@@ -234,6 +272,10 @@ def fetch_git(item):
                 sdk_link.symlink_to(sdk_source.resolve(), target_is_directory=True)
             elif not sdk_link.resolve().samefile(sdk_source.resolve()):
                 fail(f'{sdk_link} is not the pinned SDK; not replacing existing data')
+            # Validate and place the upstream-pinned archive before its zlib build.
+            # Its own sha256sum check and native compile still run unchanged.
+            if not boilerplate_zlib_ready(path):
+                stage_boilerplate_zlib(path)
             command = [*command, '--skip-sdk']
         print(f'deps: setting up {item["name"]}: {" ".join(command)}', flush=True)
         subprocess.run(command, cwd=path, check=True)
