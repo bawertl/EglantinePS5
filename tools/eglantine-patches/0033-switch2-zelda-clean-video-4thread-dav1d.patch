@@ -1,0 +1,40 @@
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -80,14 +80,14 @@
+         result.error = reason;
+         return result;
+     };
+-    // Opt-in diagnostic fallback: keep all shaders containing the native UIMAD opcode
+-    // rejected together, matching the V1.000.014 behaviour without changing the default.
+-    // The PS5 launcher reads EDEN_NX2_ALLOW_4A4=0 from the app's env.txt at startup.
++    // V1.000.017 clean-video baseline: reject the four native 0x4a4 programs by default,
++    // as in V1.000.014 (known clean intro). Explicit =1 re-enables the experimental chain.
++    // No decoder, EOF, syncpoint or other shader path is changed by this guard.
+     if (const char* allow = std::getenv("EDEN_NX2_ALLOW_4A4");
+-        allow != nullptr && allow[0] == '0' && allow[1] == '\0') {
++        allow == nullptr || allow[0] != '1' || allow[1] != '\0') {
+         for (const Instruction& instruction : code) {
+             if (instruction.Bits(0, 12) == 0x4a4) {
+-                return fail(0, "native 0x4a4 program disabled by EDEN_NX2_ALLOW_4A4=0");
++                return fail(0, "native 0x4a4 shader disabled (V1.000.014 clean-video mode)");
+             }
+         }
+     }
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -1,4 +1,13 @@
+ bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> extradata) {
++    // The PS5 sandbox cannot reliably auto-detect CPU count; libdav1d falls back to one
++    // worker when thread_count is zero. Limit this trial to AV1/libdav1d only.
++    if (const AVCodec* codec = decoder.GetCodec();
++        codec != nullptr && codec->id == AV_CODEC_ID_AV1 && codec->name != nullptr &&
++        std::string_view{codec->name} == "libdav1d") {
++        m_codec_context->thread_count = 4;
++        LOG_INFO(HW_GPU, "[AV1-THREADS] libdav1d requested_threads={}",
++                 m_codec_context->thread_count);
++    }
+     if (!extradata.empty()) {
+         av_freep(&m_codec_context->extradata);
+         m_codec_context->extradata = static_cast<u8*>(
